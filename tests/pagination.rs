@@ -136,6 +136,84 @@ async fn resets_when_cursor_is_ahead_of_the_server() {
 }
 
 #[tokio::test]
+async fn failed_full_replay_preserves_the_previous_replica() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("replica.sqlite");
+    let store = Store::open(&path).unwrap();
+    store.set_app_instance_id("installed-client").unwrap();
+    let mut engine = SyncEngine::new(client(fake(5)), store);
+    engine.sync(false).await.unwrap();
+    let original_sync_time = engine.store().last_sync_at().unwrap();
+    drop(engine);
+
+    let failing_cloud = FakeTransport::new(|request| {
+        if request.url.ends_with("start-index=0") {
+            return RawReply::json(200, page(0, &[("new", "Partial rebuild")], 5));
+        }
+        if request.url.contains("/items") {
+            return RawReply::json(500, r#"{"error":"temporary failure"}"#);
+        }
+        RawReply::json(200, META)
+    });
+    let mut engine = SyncEngine::new(client(failing_cloud), Store::open(&path).unwrap());
+
+    assert!(engine.sync(true).await.is_err());
+    assert_eq!(engine.store().cursor().unwrap(), 5);
+    assert_eq!(engine.store().task_count().unwrap(), 5);
+    assert_eq!(engine.store().last_sync_at().unwrap(), original_sync_time);
+    assert_eq!(
+        engine.store().app_instance_id().unwrap().as_deref(),
+        Some("installed-client")
+    );
+    assert!(engine.store().get_task("a").unwrap().is_some());
+    assert!(engine.store().get_task("new").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_rebuild_does_not_overwrite_concurrent_replica_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("replica.sqlite");
+    let store = Store::open(&path).unwrap();
+    store.set_history_key("HK").unwrap();
+
+    let cloud = FakeTransport::new(move |request| {
+        if request.url.ends_with("start-index=0") {
+            let mut concurrent = Store::open(&path).unwrap();
+            concurrent
+                .apply_page(
+                    0,
+                    &[things_mcp::things::IncomingItem {
+                        uuid: "concurrent".into(),
+                        action: 0,
+                        kind: "Task7".into(),
+                        props: serde_json::json!({"tt":"Concurrent task"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        server_index: 0,
+                    }],
+                    1,
+                )
+                .unwrap()
+                .unwrap();
+            return RawReply::json(200, page(0, &[("staged", "Staged task")], 1));
+        }
+        RawReply::json(200, r#"{"latest-server-index":1}"#)
+    });
+    let mut engine = SyncEngine::new(client(cloud), store);
+
+    let error = engine.sync(true).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("replica changed during the rebuild")
+    );
+    assert_eq!(engine.store().cursor().unwrap(), 1);
+    assert!(engine.store().get_task("concurrent").unwrap().is_some());
+    assert!(engine.store().get_task("staged").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn replaces_the_history_key_when_the_stored_one_is_gone() {
     let fake = FakeTransport::new(|request| {
         let url = &request.url;

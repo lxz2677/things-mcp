@@ -27,7 +27,7 @@
 | 游标 | `current-item-index` 是**服务端 head**，不是本页末尾；游标按 `start_index + len(items 数组)` 推进，循环到 head 为止 |
 | 越界 | `start-index > head` 会返回 **HTTP 500**，拉取前先用 `GET /history/{key}` 取 head |
 | 拉取顺序 | 同一 uuid 多次出现时后者覆盖前者；一个 batch 可能展开成多个实体 |
-| 推送（未实现） | `POST /commit?ancestor-index=N&_cnt=1`；create 用 34 键金标准快照，update 只发变化字段 |
+| 推送 | `POST /commit?ancestor-index=N&_cnt=1`；create 用 34 键金标准快照，update 只发变化字段 |
 | 两个易错值 | `ss`：完成 = **3**；`st`：`0=inbox / 1=started / 2=deferred` |
 | notes | `nt` 是对象；`ch` = CRC32(正文 UTF-8)；补丁 `p`/`l` 按**字节**计 |
 | 重复规则 | `rr`/`rp` 双写；这里**原样保存 JSON**，不做有损解析 |
@@ -35,7 +35,7 @@
 与上游文档不同的两处列表规则（已在代码里修正并加了测试）：
 
 - **Someday** 必须加 `start_date IS NULL`，否则会把 Upcoming 的任务也算进来
-- **Anytime** 是 `st=1 且无日期` 或 `st=0 且在项目/区域内`；文档里 `start=0` 的写法会漏掉绝大多数 Anytime 任务
+- **Anytime** 包括 `st=1` 且既无排期也无已到期 Today 引用的任务，以及 `st=0` 且在项目或区域内的任务。
 
 ---
 
@@ -63,7 +63,6 @@ TLS 使用 `rustls` + `ring`（纯 Rust），根证书走平台信任库；构�
 | `THINGS_PASSWORD` | 密码（也接受 `THINGS_TOKEN`；**不落盘、不写日志**） |
 | `THINGS_DB` | SQLite 路径。默认：macOS `~/Library/Application Support/things-mcp/things.sqlite`、Linux `$XDG_DATA_HOME/things-mcp/things.sqlite`、Windows `%APPDATA%\things-mcp\things.sqlite` |
 | `THINGS_BASE_URL` | 覆盖云端地址（测试用） |
-| `THINGS_ENABLE_WRITES` | `1`/`true`/`yes`/`on` 才允许真实推送；未设置时只能 `--dry-run` |
 | `RUST_LOG` | 日志级别（输出到 stderr） |
 
 ## 用法
@@ -94,8 +93,7 @@ cargo run --release -- show <task-id>
 # 写操作预览（不需要凭据、不联网、不写库）
 cargo run --release -- create "买牛奶" --when today --notes "两盒" --dry-run
 
-# 真实写入（需要 THINGS_ENABLE_WRITES=1）
-export THINGS_ENABLE_WRITES=1
+# 真实写入（使用配置的 Things Cloud 凭据）
 cargo run --release -- create "买牛奶" --when today
 cargo run --release -- update <id> --title "新标题" --when tomorrow
 cargo run --release -- complete <id>
@@ -138,7 +136,7 @@ cargo run --release -- serve
 | `trash_task` / `restore_task` / `delete_task` | 软删 / 恢复 / 硬删 |
 | `add_checklist_item` | 添加清单项（9 键快照） |
 
-写工具都支持 `dry_run: true`：只返回将要推送的精确 payload，不联网、不写库。
+写工具默认提交到 Things Cloud。设置 `dry_run: true` 可在本地预览 payload。
 
 行为说明：
 
@@ -169,10 +167,10 @@ Claude Desktop / Cursor 配置示例（`claude_desktop_config.json`）：
 ## 写路径安全模型
 
 1. **金标准校验**：Task7 create 必须包含全部 34 键（ChecklistItem3 = 9、Area3 = 4、Tag4 = 5），且类型正确；缺一即拒绝推送
-2. **dry-run 零副作用**：不需要凭据，不联网，不写 SQLite
-3. **环境开关**：`THINGS_ENABLE_WRITES=1` 才允许真实 commit；默认关闭
+2. **dry-run 本地预览**：无需凭据或网络。校验引用时只读打开现有副本。SQLite 可能为 WAL 副本创建协调文件。
+3. **引用校验**：真实写入先拉取变更，再从最新副本校验项目、区域、分节和目标任务
 4. **先推送后落库**：commit 成功后才应用到本地副本，避免「本地有、云端无」
-5. **冲突重试**：commit 返回 `OutdatedAncestor` → 先增量拉取再重试一次
+5. **冲突重试**：commit 返回 `OutdatedAncestor` 时，增量拉取后重新校验并重试一次
 6. **最小增量**：update 只发变化字段；只有内容/状态变化才带 `md`，纯排序不带
 7. **游标不跳**：commit 后不推进 pull 游标（只记 `commit_head`），下次拉取仍会重放自己的写入（幂等）
 
@@ -185,7 +183,7 @@ cargo build --release
 bash scripts/e2e-write.sh
 ```
 
-脚本会依次执行：`sync --full` → 真实 commit 创建 → 增量重放自己的写入 → complete → trash → delete → 再次重放 → `doctor` → `check`，并断言最后列表为空、第二次 sync 是 no-op。
+脚本为每次运行创建两个临时数据库。一个提交创建、完成、移入废纸篓和删除，另一个只从 mock cloud 拉取并逐步断言状态。最后验证删除已经重放，后续同步没有新增变更。
 
 ## 结构
 
@@ -215,7 +213,7 @@ src/
 - 每个实体表存**可查询列** + 一列 `raw`（保留全部 34 键），所以既有索引查询、也不丢未知字段
 - `apply_page` 在**一个事务**里同时提交实体和游标，并且只在游标未被其它进程推进时才提交
 - WAL + `busy_timeout`：MCP server 常驻时仍可手动跑 CLI
-- 游标越界/云历史被替换 → 自动清空本地副本并全量重拉
+- 全量同步、游标越界或历史被替换时，在临时数据库中重放历史。成功后通过一个事务替换现有副本和同步元数据。
 
 ## 测试
 

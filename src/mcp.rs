@@ -1,8 +1,4 @@
 //! MCP server (stdio transport).
-//!
-//! Read-only phase: the tools expose the local SQLite replica. Mutating tools
-//! (`create_task`, `update_task`, ...) land in Phase 2 once the gold-standard
-//! create payloads and the push safety gate are in place.
 
 use std::sync::Arc;
 
@@ -31,8 +27,8 @@ use crate::write::{TaskPatch, WriteService};
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
 const INSTRUCTIONS: &str = "\
-Things Cloud read-only tools. Everything is served from a local SQLite replica \
-that is refreshed lazily before tool calls; call `sync_now` to force a pull.\n\
+Read tools use a local SQLite replica that is refreshed lazily. Call `sync_now` to force a pull.\n\
+Write tools commit directly to Things Cloud by default. Set dry_run=true to preview the payload.\n\
 Lists: inbox, today, upcoming, anytime, someday, logbook, deadlines, repeating, \
 trash, all, project-<id>, area-<id>, tag-<id>.\n\
 Task ids are base58 strings. Dates are YYYY-MM-DD, timestamps RFC-3339.";
@@ -345,28 +341,14 @@ pub struct SyncNowArgs {
 }
 
 impl ThingsServer {
-    /// Build a write service. Dry runs need no credentials and never touch the
-    /// network; real writes require `THINGS_ENABLE_WRITES=1`.
     async fn write_service(&self, dry_run: bool) -> Result<WriteService, McpError> {
-        let store = self.open_store()?;
         if dry_run {
-            let client = ThingsClient::new(
-                Arc::new(HttpTransport::new().map_err(internal)?),
-                ClientOptions::new("dry-run", "dry-run", "dry-run"),
-            );
-            return Ok(WriteService::new(SyncEngine::new(client, store), false));
+            return Ok(WriteService::Preview(self.state.config.db_path.clone()));
         }
-
-        if !crate::write::writes_enabled_from_env() {
-            return Err(McpError::internal_error(
-                "writes are disabled: set THINGS_ENABLE_WRITES=1 (dry_run is always allowed)",
-                Some(json!({"code": "WRITES_DISABLED"})),
-            ));
-        }
-
+        let store = self.open_store()?;
         let client = self.build_client(&store)?;
         client.login().await.map_err(things_error)?;
-        Ok(WriteService::from_env(SyncEngine::new(client, store)))
+        Ok(WriteService::live(SyncEngine::new(client, store)))
     }
 }
 
@@ -672,7 +654,7 @@ impl ThingsServer {
     }
 
     #[tool(
-        description = "Create a task. Set dry_run=true to preview the exact 34-key wire payload without writing. Real writes require THINGS_ENABLE_WRITES=1."
+        description = "Create a task in Things Cloud. Set dry_run=true to preview the 34-key wire payload."
     )]
     async fn create_task(
         &self,
@@ -691,10 +673,7 @@ impl ThingsServer {
             0,
         )?;
         let mut service = self.write_service(dry_run).await?;
-        let outcome = service
-            .create_task(draft, dry_run)
-            .await
-            .map_err(write_error)?;
+        let outcome = service.create_task(draft).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
         ))
@@ -718,10 +697,7 @@ impl ThingsServer {
             1,
         )?;
         let mut service = self.write_service(dry_run).await?;
-        let outcome = service
-            .create_task(draft, dry_run)
-            .await
-            .map_err(write_error)?;
+        let outcome = service.create_task(draft).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
         ))
@@ -735,7 +711,7 @@ impl ThingsServer {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
         let outcome = service
-            .create_area(&args.title, dry_run)
+            .create_area(&args.title)
             .await
             .map_err(write_error)?;
         Ok(CallToolResult::structured(
@@ -755,7 +731,6 @@ impl ThingsServer {
                 &args.title,
                 args.parent_id.as_deref(),
                 args.shortcut.as_deref(),
-                dry_run,
             )
             .await
             .map_err(write_error)?;
@@ -821,7 +796,7 @@ impl ThingsServer {
 
         let mut service = self.write_service(dry_run).await?;
         let outcome = service
-            .update_task(&args.id, patch, dry_run)
+            .update_task(&args.id, patch)
             .await
             .map_err(write_error)?;
         Ok(CallToolResult::structured(
@@ -836,10 +811,7 @@ impl ThingsServer {
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
-        let outcome = service
-            .complete_task(&args.id, dry_run)
-            .await
-            .map_err(write_error)?;
+        let outcome = service.complete_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
         ))
@@ -852,10 +824,7 @@ impl ThingsServer {
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
-        let outcome = service
-            .cancel_task(&args.id, dry_run)
-            .await
-            .map_err(write_error)?;
+        let outcome = service.cancel_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
         ))
@@ -868,10 +837,7 @@ impl ThingsServer {
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
-        let outcome = service
-            .reopen_task(&args.id, dry_run)
-            .await
-            .map_err(write_error)?;
+        let outcome = service.reopen_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
         ))
@@ -885,7 +851,7 @@ impl ThingsServer {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
         let outcome = service
-            .trash_task(&args.id, false, dry_run)
+            .trash_task(&args.id, false)
             .await
             .map_err(write_error)?;
         Ok(CallToolResult::structured(
@@ -901,7 +867,7 @@ impl ThingsServer {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
         let outcome = service
-            .trash_task(&args.id, true, dry_run)
+            .trash_task(&args.id, true)
             .await
             .map_err(write_error)?;
         Ok(CallToolResult::structured(
@@ -916,10 +882,7 @@ impl ThingsServer {
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
-        let outcome = service
-            .delete_task(&args.id, dry_run)
-            .await
-            .map_err(write_error)?;
+        let outcome = service.delete_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
         ))
@@ -933,7 +896,7 @@ impl ThingsServer {
         let dry_run = args.dry_run.unwrap_or(false);
         let mut service = self.write_service(dry_run).await?;
         let outcome = service
-            .add_checklist_item(&args.task_id, &args.title, dry_run)
+            .add_checklist_item(&args.task_id, &args.title)
             .await
             .map_err(write_error)?;
         Ok(CallToolResult::structured(
@@ -1035,9 +998,7 @@ fn invalid_param(error: impl std::fmt::Display) -> McpError {
 
 fn write_error(error: anyhow::Error) -> McpError {
     let message = error.to_string();
-    let code = if message.contains("THINGS_ENABLE_WRITES") {
-        "WRITES_DISABLED"
-    } else if let Some(inner) = error.downcast_ref::<ThingsError>() {
+    let code = if let Some(inner) = error.downcast_ref::<ThingsError>() {
         code_of(inner)
     } else {
         "WRITE_FAILED"

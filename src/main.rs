@@ -123,7 +123,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Create a task. Requires THINGS_ENABLE_WRITES=1 unless --dry-run is used.
+    /// Create a task in Things Cloud (use --dry-run to preview).
     Create {
         title: String,
         #[arg(long)]
@@ -440,25 +440,13 @@ fn init_tracing(verbose: u8) {
 }
 
 async fn write_service(config: &Config, dry_run: bool) -> Result<WriteService> {
-    let store = open_store(config)?;
     if dry_run {
-        // Previewing a payload needs neither credentials nor the network.
-        let client = ThingsClient::new(
-            Arc::new(HttpTransport::new()?),
-            ClientOptions::new("dry-run", "dry-run", "dry-run"),
-        );
-        return Ok(WriteService::new(SyncEngine::new(client, store), false));
+        return Ok(WriteService::Preview(config.db_path.clone()));
     }
-
-    if !things_mcp::write::writes_enabled_from_env() {
-        bail!(
-            "writes are disabled: set THINGS_ENABLE_WRITES=1 to push changes (--dry-run is always allowed)"
-        );
-    }
-
+    let store = open_store(config)?;
     let client = build_client(config, &store)?;
     client.login().await.context("login failed")?;
-    Ok(WriteService::from_env(SyncEngine::new(client, store)))
+    Ok(WriteService::live(SyncEngine::new(client, store)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -486,13 +474,13 @@ async fn write_create(
     draft.tags = tags;
 
     let mut service = write_service(config, dry_run).await?;
-    let outcome = service.create_task(draft, dry_run).await?;
+    let outcome = service.create_task(draft).await?;
     print_json(&outcome)
 }
 
 async fn write_create_area(config: &Config, title: &str, dry_run: bool) -> Result<()> {
     let mut service = write_service(config, dry_run).await?;
-    print_json(&service.create_area(title, dry_run).await?)
+    print_json(&service.create_area(title).await?)
 }
 
 async fn write_create_tag(
@@ -505,7 +493,7 @@ async fn write_create_tag(
     let mut service = write_service(config, dry_run).await?;
     print_json(
         &service
-            .create_tag(title, parent.as_deref(), shortcut.as_deref(), dry_run)
+            .create_tag(title, parent.as_deref(), shortcut.as_deref())
             .await?,
     )
 }
@@ -573,7 +561,7 @@ async fn write_update(
     };
 
     let mut service = write_service(config, dry_run).await?;
-    print_json(&service.update_task(id, patch, dry_run).await?)
+    print_json(&service.update_task(id, patch).await?)
 }
 
 #[derive(Clone, Copy)]
@@ -594,19 +582,19 @@ async fn write_status(
 ) -> Result<()> {
     let mut service = write_service(config, dry_run).await?;
     let outcome = match action {
-        StatusAction::Complete => service.complete_task(id, dry_run).await?,
-        StatusAction::Cancel => service.cancel_task(id, dry_run).await?,
-        StatusAction::Reopen => service.reopen_task(id, dry_run).await?,
-        StatusAction::Trash => service.trash_task(id, false, dry_run).await?,
-        StatusAction::Restore => service.trash_task(id, true, dry_run).await?,
-        StatusAction::Delete => service.delete_task(id, dry_run).await?,
+        StatusAction::Complete => service.complete_task(id).await?,
+        StatusAction::Cancel => service.cancel_task(id).await?,
+        StatusAction::Reopen => service.reopen_task(id).await?,
+        StatusAction::Trash => service.trash_task(id, false).await?,
+        StatusAction::Restore => service.trash_task(id, true).await?,
+        StatusAction::Delete => service.delete_task(id).await?,
     };
     print_json(&outcome)
 }
 
 async fn write_checklist(config: &Config, task: &str, title: &str, dry_run: bool) -> Result<()> {
     let mut service = write_service(config, dry_run).await?;
-    print_json(&service.add_checklist_item(task, title, dry_run).await?)
+    print_json(&service.add_checklist_item(task, title).await?)
 }
 
 fn open_store(config: &Config) -> Result<Store> {

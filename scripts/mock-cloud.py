@@ -120,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 18081
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"mock cloud listening on {port}", flush=True)
+    print(server.server_port, flush=True)
     server.serve_forever()
 
 

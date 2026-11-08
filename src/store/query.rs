@@ -109,16 +109,15 @@ fn filter(kind: &ListKind, today: i64) -> (String, Vec<SqlValue>, &'static str) 
             ORDER_DEFAULT,
         ),
         ListKind::Today => (
-            // Things rolls unfinished Today tasks over, so anything started
-            // with a date up to today stays in the list. We accept either the
-            // `startDate` or the `todayIndexReferenceDate` signal.
+            // A dated task rolls into Today when its start date arrives.
+            // The Today reference is a fallback for started tasks without a date.
             format!(
-                "{task_base} AND start = 1 AND (
-                    (today_index_reference_date IS NOT NULL AND today_index_reference_date <= ?)
-                    OR (start_date IS NOT NULL AND start_date <= ?)
+                "{task_base} AND (
+                    (start IN (1, 2) AND start_date <= ?1)
+                    OR (start = 1 AND start_date IS NULL AND today_index_reference_date <= ?1)
                 )"
             ),
-            vec![SqlValue::Integer(today), SqlValue::Integer(today)],
+            vec![SqlValue::Integer(today)],
             ORDER_TODAY,
         ),
         ListKind::Upcoming => (
@@ -133,11 +132,12 @@ fn filter(kind: &ListKind, today: i64) -> (String, Vec<SqlValue>, &'static str) 
             // a project or area (`st=0`).
             format!(
                 "{task_base} AND (
-                    (start = 1 AND start_date IS NULL)
+                    (start = 1 AND start_date IS NULL
+                        AND (today_index_reference_date IS NULL OR today_index_reference_date > ?))
                     OR (start = 0 AND (project IS NOT NULL OR area IS NOT NULL))
                 )"
             ),
-            vec![],
+            vec![SqlValue::Integer(today)],
             ORDER_DEFAULT,
         ),
         ListKind::Someday => (

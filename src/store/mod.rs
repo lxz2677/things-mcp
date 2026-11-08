@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use crate::things::model::{Area, ChecklistItem, EntityKind, Tag, Task};
@@ -36,6 +36,14 @@ const SCHEMA_VERSION: i64 = 1;
 
 pub struct Store {
     conn: Connection,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SyncState {
+    pub history_key: Option<String>,
+    pub cursor: i64,
+    pub generation: i64,
+    commit_head: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -61,6 +69,16 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
+    }
+
+    pub(crate) fn open_read_only(path: &Path) -> Result<Option<Self>> {
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening database {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        Ok(Some(Self { conn }))
     }
 
     fn init(conn: Connection) -> Result<Self> {
@@ -143,10 +161,6 @@ impl Store {
         meta_i64(&self.conn, "commit_head")
     }
 
-    pub fn set_commit_head(&self, value: i64) -> Result<()> {
-        set_meta(&self.conn, "commit_head", &value.to_string())
-    }
-
     pub fn latest_server_index(&self) -> Result<Option<i64>> {
         meta_i64(&self.conn, "latest_server_index")
     }
@@ -171,6 +185,24 @@ impl Store {
         self.meta_set("last_sync_at", value)
     }
 
+    pub(crate) fn sync_state(&self) -> Result<SyncState> {
+        sync_state(&self.conn)
+    }
+
+    pub(crate) fn bind_history(&self, history_key: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES('history_key', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE meta.value = '' OR meta.value = excluded.value",
+            [history_key],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "replica history changed during sync; retry the operation"
+        );
+        Ok(())
+    }
+
     // -------------------------------------------------------------- applying
 
     /// Apply items and advance the cursor atomically.
@@ -183,9 +215,38 @@ impl Store {
         items: &[IncomingItem],
         next_cursor: i64,
     ) -> Result<Option<ApplyStats>> {
+        self.apply_page_inner(expected_cursor, items, next_cursor, None)
+    }
+
+    pub(crate) fn apply_history_page(
+        &mut self,
+        expected_cursor: i64,
+        items: &[IncomingItem],
+        next_cursor: i64,
+        history_key: &str,
+        generation: i64,
+    ) -> Result<Option<ApplyStats>> {
+        self.apply_page_inner(
+            expected_cursor,
+            items,
+            next_cursor,
+            Some((history_key, generation)),
+        )
+    }
+
+    fn apply_page_inner(
+        &mut self,
+        expected_cursor: i64,
+        items: &[IncomingItem],
+        next_cursor: i64,
+        history: Option<(&str, i64)>,
+    ) -> Result<Option<ApplyStats>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((key, generation)) = history {
+            check_generation(&tx, key, generation)?;
+        }
         let current = meta_i64(&tx, CURSOR_KEY)?.unwrap_or(0);
         if current != expected_cursor {
             // Dropping the transaction rolls back; nothing was written.
@@ -205,19 +266,93 @@ impl Store {
         Ok(stats)
     }
 
-    /// Remove every cached entity and reset the cursor.
-    pub fn reset(&mut self) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute_batch(
-            "DELETE FROM task;
-             DELETE FROM area;
-             DELETE FROM tag;
-             DELETE FROM checklist_item;
-             DELETE FROM task_tag;
-             DELETE FROM area_tag;",
-        )?;
-        set_meta(&tx, CURSOR_KEY, "0")?;
+    pub(crate) fn apply_commit(
+        &mut self,
+        item: &IncomingItem,
+        history_key: &str,
+        generation: i64,
+        head: i64,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = sync_state(&tx)?;
+        if state.history_key.as_deref() == Some(history_key)
+            && state.generation == generation
+            && state.cursor < head
+            && state.commit_head.unwrap_or(0) < head
+        {
+            apply_items(&tx, std::slice::from_ref(item))?;
+            set_meta(&tx, "commit_head", &head.to_string())?;
+        }
         tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_sync(
+        &mut self,
+        history_key: &str,
+        generation: i64,
+        schema: i64,
+        head: i64,
+        timestamp: &str,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_generation(&tx, history_key, generation)?;
+        if meta_i64(&tx, "schema")?.unwrap_or(0) == 0 && schema != 0 {
+            set_meta(&tx, "schema", &schema.to_string())?;
+        }
+        let head = head.max(meta_i64(&tx, "latest_server_index")?.unwrap_or(0));
+        set_meta(&tx, "latest_server_index", &head.to_string())?;
+        set_meta(&tx, "last_sync_at", timestamp)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn replace_replica(&mut self, path: &Path, expected: &SyncState) -> Result<()> {
+        let path = path.to_str().context("staged replica path must be UTF-8")?;
+        self.conn.execute("ATTACH DATABASE ?1 AS staged", [path])?;
+        let result: Result<()> = (|| {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            anyhow::ensure!(
+                sync_state(&tx)? == *expected,
+                "replica changed during the rebuild; retry the operation"
+            );
+            for table in [
+                "task",
+                "area",
+                "tag",
+                "checklist_item",
+                "task_tag",
+                "area_tag",
+            ] {
+                tx.execute_batch(&format!(
+                    "DELETE FROM main.{table};
+                     INSERT INTO main.{table} SELECT * FROM staged.{table};"
+                ))?;
+            }
+            tx.execute_batch(
+                "DELETE FROM main.meta WHERE key IN (
+                    'history_key', 'processed_remote_index', 'schema',
+                    'latest_server_index', 'last_sync_at', 'commit_head'
+                 );
+                 INSERT INTO main.meta SELECT * FROM staged.meta;",
+            )?;
+            set_meta(
+                &tx,
+                "sync_generation",
+                &(expected.generation + 1).to_string(),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        let detached = self.conn.execute_batch("DETACH DATABASE staged");
+        result?;
+        detached?;
         Ok(())
     }
 
@@ -255,6 +390,39 @@ impl Store {
 }
 
 const CURSOR_KEY: &str = "processed_remote_index";
+
+fn sync_state(conn: &Connection) -> Result<SyncState> {
+    Ok(conn.query_row(
+        "SELECT
+           (SELECT value FROM meta WHERE key = 'history_key'),
+           (SELECT value FROM meta WHERE key = ?1),
+           (SELECT value FROM meta WHERE key = 'sync_generation'),
+           (SELECT value FROM meta WHERE key = 'commit_head')",
+        [CURSOR_KEY],
+        |row| {
+            let integer = |index| -> rusqlite::Result<Option<i64>> {
+                Ok(row
+                    .get::<_, Option<String>>(index)?
+                    .and_then(|value| value.parse().ok()))
+            };
+            Ok(SyncState {
+                history_key: row.get(0)?,
+                cursor: integer(1)?.unwrap_or(0),
+                generation: integer(2)?.unwrap_or(0),
+                commit_head: integer(3)?,
+            })
+        },
+    )?)
+}
+
+fn check_generation(conn: &Connection, history_key: &str, generation: i64) -> Result<()> {
+    let state = sync_state(conn)?;
+    anyhow::ensure!(
+        state.history_key.as_deref() == Some(history_key) && state.generation == generation,
+        "replica history changed during sync; retry the operation"
+    );
+    Ok(())
+}
 
 fn meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>> {
     Ok(conn

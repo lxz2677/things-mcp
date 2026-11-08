@@ -90,6 +90,32 @@ fn titles(store: &Store, kind: &ListKind, today: i64) -> Vec<String> {
 }
 
 #[test]
+fn a_scheduled_task_moves_from_upcoming_to_today_on_its_start_date() {
+    let mut store = Store::open_in_memory().unwrap();
+    let today = fmt::today_epoch_day();
+    seed(&mut store, today);
+
+    assert!(
+        titles(&store, &ListKind::Upcoming, today)
+            .iter()
+            .any(|title| title == "upcoming task")
+    );
+    for day in [today + 1, today + 2] {
+        let tasks = list_tasks(store.connection(), &ListKind::Today, day, 100, 0).unwrap();
+        let scheduled = tasks
+            .iter()
+            .find(|task| task.title == "upcoming task")
+            .unwrap();
+        assert_eq!(scheduled.view_str(day), "today");
+        assert!(
+            !titles(&store, &ListKind::Upcoming, day)
+                .iter()
+                .any(|title| title == "upcoming task")
+        );
+    }
+}
+
+#[test]
 fn list_semantics_match_the_documented_rules() {
     let mut store = Store::open_in_memory().unwrap();
     let today = fmt::today_epoch_day();

@@ -458,7 +458,7 @@ impl ThingsClient {
             };
             let reply = self.transport.execute(request).await?;
 
-            match classify(&reply, path) {
+            match classify(&reply, path, method == "POST" && path.ends_with("/commit")) {
                 None => return Ok(reply),
                 Some(error) => {
                     let retryable =
@@ -627,18 +627,23 @@ impl ThingsClient {
     }
 }
 
-fn classify(reply: &RawReply, path: &str) -> Option<ThingsError> {
+fn classify(reply: &RawReply, path: &str, is_commit: bool) -> Option<ThingsError> {
     let signal = reply.header("things-response").unwrap_or_default();
-    let body_text = reply.body_text();
-    let lower = body_text.to_lowercase();
-
-    // The backend signals a stale ancestor either with HTTP 409 or with an
-    // `OutdatedAncestor` marker in the body.
-    if reply.status == 409
-        || lower.contains("outdatedancestor")
-        || lower.contains("outdated ancestor")
-    {
-        return Some(ThingsError::Conflict(body_text));
+    if is_commit {
+        let outdated_ancestor = |code: &str| {
+            code.eq_ignore_ascii_case("OutdatedAncestor")
+                || code.eq_ignore_ascii_case("Outdated Ancestor")
+        };
+        if reply.status == 409
+            || outdated_ancestor(signal)
+            || serde_json::from_slice::<Value>(&reply.body).is_ok_and(|body| {
+                body.get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(outdated_ancestor)
+            })
+        {
+            return Some(ThingsError::Conflict(reply.body_text()));
+        }
     }
 
     match signal {
@@ -886,5 +891,28 @@ mod tests {
 
         assert_eq!(meta.latest_server_index, 5);
         assert_eq!(meta.latest_schema_version, 0);
+    }
+
+    #[tokio::test]
+    async fn a_task_title_cannot_be_mistaken_for_a_commit_conflict() {
+        let fake = crate::testing::FakeTransport::new(|_| {
+            RawReply::json(
+                200,
+                r#"{"current-item-index":1,"items":[{"id":{"t":0,"e":"Task7","p":{"tt":"Outdated ancestor notes"}}}]}"#,
+            )
+        });
+        let client = ThingsClient::new(fake, ClientOptions::new("me@example.com", "pw", "app"));
+
+        let page = client.items_page("HK", 0).await.unwrap();
+        assert_eq!(page.items[0].props["tt"], "Outdated ancestor notes");
+    }
+
+    #[test]
+    fn a_structured_commit_error_can_signal_a_conflict_without_http_409() {
+        let reply = RawReply::json(400, r#"{"error":"OutdatedAncestor"}"#);
+        assert!(matches!(
+            classify(&reply, "/commit", true),
+            Some(ThingsError::Conflict(_))
+        ));
     }
 }

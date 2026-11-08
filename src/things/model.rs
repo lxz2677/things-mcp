@@ -158,11 +158,18 @@ impl Task {
             START_TODAY => match self.start_date {
                 Some(d) if d <= today => "today",
                 Some(_) => "upcoming",
+                None if self
+                    .today_index_reference_date
+                    .is_some_and(|day| day <= today) =>
+                {
+                    "today"
+                }
                 None => "anytime",
             },
             START_SOMEDAY => match self.start_date {
                 Some(d) if d > today => "upcoming",
-                _ => "someday",
+                Some(_) => "today",
+                None => "someday",
             },
             _ => "unknown",
         }

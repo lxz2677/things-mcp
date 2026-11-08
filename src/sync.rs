@@ -37,6 +37,7 @@ pub struct SyncReport {
     pub unknown: u64,
     pub full_reset: bool,
     pub history_replaced: bool,
+    pub(crate) generation: i64,
 }
 
 impl SyncEngine {
@@ -57,142 +58,172 @@ impl SyncEngine {
     }
 
     pub async fn sync(&mut self, full: bool) -> Result<SyncReport> {
-        if full {
-            self.store.reset()?;
-        }
-
-        let (history_key, meta, history_replaced) = self.resolve_history().await?;
-        let mut head = meta.latest_server_index;
-        let mut cursor = self.store.cursor()?;
-
-        if self.store.schema_version()? == 0 && meta.latest_schema_version != 0 {
-            self.store.set_schema_version(meta.latest_schema_version)?;
+        let state = self.store.sync_state()?;
+        let (history_key, meta, mut history_replaced) =
+            resolve_history(&self.client, state.history_key.as_deref()).await?;
+        if state.cursor > meta.latest_server_index {
+            tracing::warn!(
+                cursor = state.cursor,
+                head = meta.latest_server_index,
+                "local cursor is ahead of the server head; rebuilding the local replica"
+            );
+            history_replaced = true;
         }
 
         let mut report = SyncReport {
-            history_key: history_key.clone(),
-            head,
+            history_key,
+            head: meta.latest_server_index,
             full_reset: full,
             history_replaced,
             ..Default::default()
         };
+        if full || history_replaced {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("replica.sqlite");
+            let mut staged = Store::open(&path)?;
+            staged.bind_history(&report.history_key)?;
+            pull_history(
+                &self.client,
+                &mut staged,
+                &mut report,
+                meta.latest_schema_version,
+            )
+            .await?;
+            drop(staged);
+            self.store.replace_replica(&path, &state)?;
+            report.generation = state.generation + 1;
+        } else {
+            if state.history_key.as_deref() != Some(report.history_key.as_str()) {
+                self.store.bind_history(&report.history_key)?;
+            }
+            report.cursor = state.cursor;
+            report.generation = state.generation;
+            pull_history(
+                &self.client,
+                &mut self.store,
+                &mut report,
+                meta.latest_schema_version,
+            )
+            .await?;
+        }
+        Ok(report)
+    }
+}
 
-        // A cursor beyond the head means the cloud history was replaced.
-        if cursor > head {
-            tracing::warn!(
-                cursor,
-                head,
-                "local cursor is ahead of the server head; resetting the local replica"
-            );
-            self.store.reset()?;
-            cursor = 0;
-            report.history_replaced = true;
+async fn resolve_history(
+    client: &ThingsClient,
+    stored: Option<&str>,
+) -> Result<(String, HistoryMeta, bool)> {
+    let history_key = match stored.filter(|key| !key.is_empty()) {
+        Some(key) => key.to_owned(),
+        None => client.own_history_key().await?.history_key,
+    };
+    anyhow::ensure!(
+        !history_key.is_empty(),
+        "server returned an empty history key"
+    );
+
+    match client.history_meta(&history_key).await {
+        Ok(meta) => Ok((history_key, meta, false)),
+        Err(ThingsError::NotFound(found)) => {
+            tracing::warn!(path = %found, "history key not found; checking for a replaced history");
+            let own = client.own_history_key().await?;
+            if own.history_key == history_key || own.history_key.is_empty() {
+                bail!("history {history_key} is not available on the server");
+            }
+            let meta = client.history_meta(&own.history_key).await?;
+            Ok((own.history_key, meta, true))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn pull_history(
+    client: &ThingsClient,
+    store: &mut Store,
+    report: &mut SyncReport,
+    schema: i64,
+) -> Result<()> {
+    let history_key = &report.history_key;
+    let mut cursor = report.cursor;
+    let mut head = report.head;
+    tracing::info!(history_key = %history_key, cursor, head, "sync started");
+
+    let mut pages = 0usize;
+    let mut empty_pages = 0usize;
+
+    while cursor < head {
+        if pages >= MAX_PAGES {
+            bail!("pull exceeded {MAX_PAGES} pages; aborting to avoid a loop");
         }
 
-        tracing::info!(history_key = %history_key, cursor, head, "sync started");
+        let page = client.items_page(history_key, cursor as usize).await?;
 
-        let mut pages = 0usize;
-        let mut empty_pages = 0usize;
-
-        while cursor < head {
-            if pages >= MAX_PAGES {
-                bail!("pull exceeded {MAX_PAGES} pages; aborting to avoid a loop");
-            }
-
-            let page = self
-                .client
-                .items_page(&history_key, cursor as usize)
-                .await?;
-
-            if page.batches == 0 {
-                empty_pages += 1;
-                if empty_pages > MAX_EMPTY_PAGES {
-                    return Err(ThingsError::Stalled {
-                        cursor: cursor as usize,
-                        head,
-                    }
-                    .into());
+        if page.batches == 0 {
+            empty_pages += 1;
+            if empty_pages > MAX_EMPTY_PAGES {
+                return Err(ThingsError::Stalled {
+                    cursor: cursor as usize,
+                    head,
                 }
+                .into());
+            }
+            tracing::debug!(
+                cursor,
+                head,
+                "empty page below head; re-reading history meta"
+            );
+            let refreshed = client.history_meta(history_key).await?;
+            head = head.max(refreshed.latest_server_index);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        empty_pages = 0;
+        head = head.max(page.head);
+
+        let next = cursor + page.batches as i64;
+        match store.apply_history_page(cursor, &page.items, next, history_key, report.generation)? {
+            Some(stats) => {
+                report.upserted += stats.upserted;
+                report.deleted += stats.deleted;
+                report.skipped += stats.skipped;
+                report.unknown += stats.unknown;
+                report.items += page.items.len();
+                pages += 1;
+                cursor = next;
                 tracing::debug!(
                     cursor,
                     head,
-                    "empty page below head; re-reading history meta"
+                    batches = page.batches,
+                    items = page.items.len(),
+                    "pulled page"
                 );
-                let refreshed = self.client.history_meta(&history_key).await?;
-                head = head.max(refreshed.latest_server_index);
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                if pages.is_multiple_of(50) {
+                    tracing::info!(cursor, head, items = report.items, "pulling history...");
+                }
+            }
+            None => {
+                // Another process (e.g. the MCP server) already advanced the
+                // cursor; the page we fetched may have been applied by it.
+                cursor = store.cursor()?;
+                tracing::debug!(cursor, "cursor advanced by another process");
                 continue;
             }
-            empty_pages = 0;
-
-            let next = cursor + page.batches as i64;
-            match self.store.apply_page(cursor, &page.items, next)? {
-                Some(stats) => {
-                    report.upserted += stats.upserted;
-                    report.deleted += stats.deleted;
-                    report.skipped += stats.skipped;
-                    report.unknown += stats.unknown;
-                    report.items += page.items.len();
-                    pages += 1;
-                    cursor = next;
-                    tracing::debug!(
-                        cursor,
-                        head,
-                        batches = page.batches,
-                        items = page.items.len(),
-                        "pulled page"
-                    );
-                    if pages % 50 == 0 {
-                        tracing::info!(cursor, head, items = report.items, "pulling history...");
-                    }
-                }
-                None => {
-                    // Another process (e.g. the MCP server) already advanced the
-                    // cursor; the page we fetched may have been applied by it.
-                    cursor = self.store.cursor()?;
-                    tracing::debug!(cursor, "cursor advanced by another process");
-                    continue;
-                }
-            }
-
-            head = head.max(page.head);
-        }
-
-        self.store.set_latest_server_index(head)?;
-        self.store.set_last_sync_at(&fmt::now_rfc3339())?;
-        tracing::info!(pages, items = report.items, cursor, head, "sync finished");
-
-        report.cursor = cursor;
-        report.head = head;
-        report.pages = pages;
-        Ok(report)
-    }
-
-    async fn resolve_history(&mut self) -> Result<(String, HistoryMeta, bool)> {
-        let stored = self.store.history_key()?;
-        let history_key = match stored.filter(|key| !key.is_empty()) {
-            Some(key) => key,
-            None => {
-                let own = self.client.own_history_key().await?;
-                self.store.set_history_key(&own.history_key)?;
-                own.history_key
-            }
-        };
-
-        match self.client.history_meta(&history_key).await {
-            Ok(meta) => Ok((history_key, meta, false)),
-            Err(ThingsError::NotFound(found)) => {
-                tracing::warn!(path = %found, "history key not found; checking for a replaced history");
-                let own = self.client.own_history_key().await?;
-                if own.history_key == history_key {
-                    bail!("history {history_key} is not available on the server");
-                }
-                self.store.reset()?;
-                self.store.set_history_key(&own.history_key)?;
-                let meta = self.client.history_meta(&own.history_key).await?;
-                Ok((own.history_key, meta, true))
-            }
-            Err(error) => Err(error.into()),
         }
     }
+
+    head = head.max(cursor);
+    store.finish_sync(
+        history_key,
+        report.generation,
+        schema,
+        head,
+        &fmt::now_rfc3339(),
+    )?;
+    tracing::info!(pages, items = report.items, cursor, head, "sync finished");
+
+    report.cursor = cursor;
+    report.head = head;
+    report.pages = pages;
+    Ok(())
 }
