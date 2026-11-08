@@ -84,6 +84,15 @@ pub fn default_db_path() -> PathBuf {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata)
+                .join("things-mcp")
+                .join(DEFAULT_DB_FILE);
+        }
+    }
+
     if let Some(xdg) = env_non_empty("XDG_DATA_HOME") {
         return PathBuf::from(xdg).join("things-mcp").join(DEFAULT_DB_FILE);
     }

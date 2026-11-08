@@ -46,7 +46,14 @@ cargo build --release
 cargo test
 ```
 
-依赖使用系统 TLS（macOS 走 Security.framework），不依赖 cmake/nasm。
+TLS 使用 `rustls` + `ring`（纯 Rust），根证书走平台信任库；构建和运行都**不需要 OpenSSL、cmake 或 nasm**。
+
+## 跨平台
+
+- **纯 Rust**：不需要 Things.app、AppleScript、macOS API；Linux / macOS / Windows 都能跑
+- **唯一的平台分支**是默认数据目录：macOS `~/Library/Application Support/things-mcp/`、Linux `$XDG_DATA_HOME/things-mcp/`、Windows `%APPDATA%\\things-mcp\\`，都可用 `THINGS_DB` 覆盖
+- 协议里的 `App-Id: com.culturedcode.ThingsMac`、`User-Agent: ThingsMac/...`、`Things-Client-Info` 里的 `on: macOS` 是**客户端身份标识**（模拟官方 Mac 客户端），不是运行时依赖
+- CI 在 Ubuntu / macOS / Windows 三个平台上跑 `cargo test`
 
 ## 配置
 
@@ -54,7 +61,7 @@ cargo test
 |---|---|
 | `THINGS_EMAIL` | 账号邮箱（也接受 `THINGS_USERNAME`） |
 | `THINGS_PASSWORD` | 密码（也接受 `THINGS_TOKEN`；**不落盘、不写日志**） |
-| `THINGS_DB` | SQLite 路径，默认 macOS `~/Library/Application Support/things-mcp/things.sqlite` |
+| `THINGS_DB` | SQLite 路径。默认：macOS `~/Library/Application Support/things-mcp/things.sqlite`、Linux `$XDG_DATA_HOME/things-mcp/things.sqlite`、Windows `%APPDATA%\things-mcp\things.sqlite` |
 | `THINGS_BASE_URL` | 覆盖云端地址（测试用） |
 | `RUST_LOG` | 日志级别（输出到 stderr） |
 
@@ -175,7 +182,13 @@ src/
 cargo test
 ```
 
-覆盖：Task7 解码、notes 字节补丁（含 emoji/中文边界）、分页（**截断页**、head 边界、stalled、历史重置）、游标并发接管、列表互斥性、搜索、字段级合并，**完整历史重放**（create/update/notes 补丁/硬删/tombstone/Settings）、认证回退（raw → percent-encode）、429 重试，以及**真实二进制**的 stdio MCP 端到端（`tools/list` 17 个工具 + `tools/call`）。
+覆盖：Task7 解码、notes 字节补丁（含 emoji/中文边界）、分页（**截断页**、head 边界、stalled、历史重置）、游标并发接管、列表互斥性、搜索、字段级合并，**完整历史重放**（create/update/notes 补丁/硬删/tombstone/Settings）、认证回退（raw → percent-encode）、429 重试、历史 key 轮换、双连接并发写入，以及**真实二进制**的 stdio MCP 端到端（`tools/list` 17 个工具 + `tools/call`）。
+
+另有一个需联网的 TLS 冒烟测试（默认 ignored）：
+
+```bash
+cargo test --test tls_smoke -- --ignored
+```
 
 ## 验收记录
 

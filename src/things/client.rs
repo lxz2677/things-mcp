@@ -84,6 +84,11 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new() -> anyhow::Result<Self> {
+        // reqwest is built with `rustls-no-provider` so the binary has no
+        // system TLS dependency (no OpenSSL, no Security.framework, no cmake).
+        // Ring is the pure-Rust provider we install once per process.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()?;
