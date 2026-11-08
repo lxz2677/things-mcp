@@ -4,7 +4,7 @@
 
 当前进度：**Phase 0+1（只读）完成** —— 认证、分页拉取、Task7 wire 解码、SQLite 副本、列表/搜索查询、CLI 验证命令，以及 **stdio MCP server（17 个读工具）**。真实账号对拍待跑。
 
-设计依据：[things-mcp-rust/docs](/Users/howieli/Work/WorkSpace/reverse/things/things-mcp-rust/docs/06-roadmap-risks.md) 的 6 份方案文档 + `things4Android-share-20261108/reverse-engineering/` 的抓包实证。实现逻辑参照 [pdurlej/things-cloud-sdk](https://github.com/pdurlej/things-cloud-sdk)，但把它的 `Task6` 协议升级到当前云端在用的 `Task7`。
+设计依据：本地的 6 份方案文档 + `things4Android-share-20261108/reverse-engineering/` 的抓包实证（这些材料未随仓库发布）。实现逻辑参照 [pdurlej/things-cloud-sdk](https://github.com/pdurlej/things-cloud-sdk)，但把它的 `Task6` 协议升级到当前云端在用的 `Task7`。
 
 ---
 
@@ -126,12 +126,12 @@ Claude Desktop / Cursor 配置示例（`claude_desktop_config.json`）：
 {
   "mcpServers": {
     "things": {
-      "command": "/Users/howieli/Work/WorkSpace/things-mcp/target/release/things-mcp",
+      "command": "/absolute/path/to/things-mcp/target/release/things-mcp",
       "args": ["serve"],
       "env": {
         "THINGS_EMAIL": "you@example.com",
         "THINGS_PASSWORD": "your-password",
-        "THINGS_DB": "/Users/howieli/Library/Application Support/things-mcp/things.sqlite"
+        "THINGS_DB": "/Users/you/Library/Application Support/things-mcp/things.sqlite"
       }
     }
   }
@@ -193,3 +193,10 @@ no-op: PASS    data stable: PASS    audit: PASS
 1. **真实账号对拍**：`sync --full` 后跑 `verify`，把 Inbox/Today/Upcoming/Anytime/Someday/Logbook 的计数与 Mac 上 Things 对齐；不一致就调 `src/store/query.rs` 的列表条件
 2. Phase 2：写工具（`create_task` / `update_task` / `complete_task` / `cancel_task` / `trash_task` / `move_task` / `add_checklist`），写库 + operation_log
 3. Phase 3：金标准 34 键安全闸 + `POST /commit` 推送 + 三方合并
+
+## 免责声明
+
+- 本项目与 Cultured Code 无关，Things® 是其商标。
+- 它通过逆向得到的私有协议直接访问 Things Cloud，**可能违反其服务条款**，协议也可能随时变更。
+- 仅建议用于**个人账号、个人设备**的自用自动化；不要用于批量操作、压测或面向多用户的公开服务。
+- 写操作（Phase 2）会直接影响你所有已登录设备的同步数据，请先 `dry_run` 并小规模对拍。
