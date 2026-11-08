@@ -12,7 +12,7 @@
 在 macOS 或 Linux 上运行这一行。
 
 ```sh
-installer=$(curl -fsSL https://github.com/lxz2677/things-mcp/releases/latest/download/install.sh) && sh -c "$installer"
+(cd "$HOME" && installer=$(curl -fsSL https://github.com/lxz2677/things-mcp/releases/latest/download/install.sh) && sh -c "$installer")
 ```
 
 安装器会选好对应的预编译包，校验 SHA-256，然后安装到 `~/.local/bin`。

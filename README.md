@@ -12,7 +12,7 @@ English · [简体中文](README.zh-CN.md)
 Run this command on macOS or Linux.
 
 ```sh
-installer=$(curl -fsSL https://github.com/lxz2677/things-mcp/releases/latest/download/install.sh) && sh -c "$installer"
+(cd "$HOME" && installer=$(curl -fsSL https://github.com/lxz2677/things-mcp/releases/latest/download/install.sh) && sh -c "$installer")
 ```
 
 The installer selects the matching release binary, verifies its SHA-256 checksum, and installs it in `~/.local/bin`.
