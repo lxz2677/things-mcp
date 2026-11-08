@@ -176,6 +176,17 @@ Claude Desktop / Cursor 配置示例（`claude_desktop_config.json`）：
 6. **最小增量**：update 只发变化字段；只有内容/状态变化才带 `md`，纯排序不带
 7. **游标不跳**：commit 后不推进 pull 游标（只记 `commit_head`），下次拉取仍会重放自己的写入（幂等）
 
+### 本地写路径端到端（不需要真实账号）
+
+仓库自带一个内存版 Things Cloud mock（`scripts/mock-cloud.py`）：它实现认证、拉取、commit、祖先索引检查和重放，能完整跑一遍写路径而**不碰真实账号**。
+
+```bash
+cargo build --release
+bash scripts/e2e-write.sh
+```
+
+脚本会依次执行：`sync --full` → 真实 commit 创建 → 增量重放自己的写入 → complete → trash → delete → 再次重放 → `doctor` → `check`，并断言最后列表为空、第二次 sync 是 no-op。
+
 ## 结构
 
 ```
@@ -190,6 +201,7 @@ src/
 │   ├── mod.rs           # 打开/迁移、原子 apply_page、meta
 │   └── query.rs         # 列表语义、搜索、项目/区域/标签、详情
 ├── mcp.rs               # stdio MCP server：17 读 + 12 写工具
+├── write.rs             # 写路径：安全闸、commit、冲突重试、dry-run
 ├── sync.rs              # 分页拉取、游标、并发接管、历史重置
 ├── testing.rs           # FakeTransport（测试用）
 └── things/
@@ -212,6 +224,12 @@ cargo test
 ```
 
 覆盖：Task7 解码、notes 字节补丁（含 emoji/中文边界）、分页（**截断页**、head 边界、stalled、历史重置）、游标并发接管、列表互斥性、搜索、字段级合并，**完整历史重放**（create/update/notes 补丁/硬删/tombstone/Settings）、认证回退（raw → percent-encode）、429 重试、历史 key 轮换、双连接并发写入，以及**真实二进制**的 stdio MCP 端到端（`tools/list` 29 个工具 + 读/写 `tools/call`，写操作用 dry-run）。
+
+本地写路径端到端（mock cloud）：
+
+```bash
+bash scripts/e2e-write.sh
+```
 
 另有一个需联网的 TLS 冒烟测试（默认 ignored）：
 
