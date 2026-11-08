@@ -19,7 +19,10 @@ use crate::ids;
 use crate::store::Store;
 use crate::sync::SyncEngine;
 use crate::things::encode::{self, TaskDraft, When};
-use crate::things::{ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem, ThingsError};
+use crate::things::{
+    ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem, TYPE_HEADING, TYPE_PROJECT,
+    ThingsError,
+};
 
 #[derive(Debug, Default, Clone)]
 pub struct TaskPatch {
@@ -102,6 +105,7 @@ impl WriteService {
     // --------------------------------------------------------------- creates
 
     pub async fn create_task(&mut self, draft: TaskDraft, dry_run: bool) -> Result<WriteOutcome> {
+        self.validate_container(&draft.project, &draft.area, &draft.heading)?;
         let payload =
             encode::task_create_payload(&draft, fmt::today_epoch_day(), fmt::now_seconds());
         encode::validate_task_create(&payload)?;
@@ -147,6 +151,11 @@ impl WriteService {
         shortcut: Option<&str>,
         dry_run: bool,
     ) -> Result<WriteOutcome> {
+        if let Some(parent) = parent {
+            if self.engine.store().get_tag(parent)?.is_none() {
+                bail!("parent tag {parent} not found locally");
+            }
+        }
         let payload = encode::tag_create_payload(title, 0, parent, shortcut);
         encode::validate_tag_create(&payload)?;
 
@@ -202,6 +211,11 @@ impl WriteService {
             bail!("nothing to update: provide at least one field");
         }
         let existing = self.expect_task(id)?;
+        self.validate_container(
+            &patch.project.clone().flatten(),
+            &patch.area.clone().flatten(),
+            &patch.heading.clone().flatten(),
+        )?;
         let today = fmt::today_epoch_day();
         let now = fmt::now_seconds();
         let mut delta = Map::new();
@@ -421,6 +435,38 @@ impl WriteService {
             server_index: 0,
         };
         self.engine.store_mut().apply_items(&[item])?;
+        Ok(())
+    }
+
+    fn validate_container(
+        &self,
+        project: &Option<String>,
+        area: &Option<String>,
+        heading: &Option<String>,
+    ) -> Result<()> {
+        if let Some(id) = project {
+            let task = self.engine.store().get_task(id)?.ok_or_else(|| {
+                anyhow!("project {id} not found locally; run `things-mcp sync` first")
+            })?;
+            if task.type_ != TYPE_PROJECT {
+                bail!("{id} is not a project (type {})", task.type_);
+            }
+        }
+        if let Some(id) = area {
+            if self.engine.store().get_area(id)?.is_none() {
+                bail!("area {id} not found locally; run `things-mcp sync` first");
+            }
+        }
+        if let Some(id) = heading {
+            let task = self
+                .engine
+                .store()
+                .get_task(id)?
+                .ok_or_else(|| anyhow!("heading {id} not found locally"))?;
+            if task.type_ != TYPE_HEADING {
+                bail!("{id} is not a heading (type {})", task.type_);
+            }
+        }
         Ok(())
     }
 
@@ -670,6 +716,46 @@ mod tests {
         assert_eq!(body["task-1"]["e"], "Task7");
         assert_eq!(body["task-1"]["p"], json!({}));
         assert!(service.store().get_task("task-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_create_with_an_unknown_project() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::new(engine(fake.clone(), None), false);
+
+        let mut draft = TaskDraft::new("orphan");
+        draft.project = Some("missing-project".into());
+
+        let error = service.create_task(draft, true).await.unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
+        assert!(fake.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepts_a_create_in_a_known_project() {
+        let fake = fake_ok(1);
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_history_key("HK").unwrap();
+        store
+            .apply_items(&[IncomingItem {
+                uuid: "proj".into(),
+                action: ACTION_CREATE,
+                kind: encode::TASK_KIND.into(),
+                props: json!({"tt": "Proj", "tp": 1, "st": 1, "ss": 0})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                server_index: 0,
+            }])
+            .unwrap();
+
+        let mut service = WriteService::new(SyncEngine::new(client(fake), store), false);
+        let mut draft = TaskDraft::new("child");
+        draft.project = Some("proj".into());
+
+        let outcome = service.create_task(draft, true).await.unwrap();
+        assert_eq!(outcome.status, "dry-run");
+        assert_eq!(outcome.payload["pr"], json!(["proj"]));
     }
 
     #[tokio::test]
