@@ -91,8 +91,9 @@ jobs:
           tag_path=$(jq -nr --arg tag "$tag" '$tag | @uri')
           {
             printf '#!/bin/sh\nrelease_url=%q\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$tag_path"
-            tail -n +2 ../scripts/install.sh
+            sed '1d; /^release_url=/d' ../scripts/install.sh
           } > install.sh
+          sh -n install.sh
           assets=("${archives[@]}" SHA256SUMS install.sh)
 
           prerelease=false

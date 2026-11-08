@@ -12,10 +12,10 @@ English · [简体中文](README.zh-CN.md)
 Run this command on macOS or Linux.
 
 ```sh
-(cd "$HOME" && installer=$(curl -fsSL https://github.com/lxz2677/things-mcp/releases/latest/download/install.sh) && sh -c "$installer")
+(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && eval "$installer")
 ```
 
-The installer selects the matching release binary, verifies its SHA-256 checksum, and installs it in `~/.local/bin`.
+Enter an installation directory when prompted, or press Enter to use your home directory. Without a terminal, the installer uses the home directory by default. Set `THINGS_MCP_INSTALL_DIR` to choose a different directory for automated installs. The installer verifies the release checksum and prints the full path to `things-mcp`.
 
 ### Install with an agent
 
@@ -36,13 +36,13 @@ The file stores plaintext credentials. Restrict access with `chmod 600 ~/.things
 
 ### Add the MCP server
 
-Set your MCP client to launch the installed binary over stdio. Replace the command with the full path on your machine.
+Use the absolute path printed by the installer as the MCP command and pass the `serve` argument.
 
 ```json
 {
   "mcpServers": {
     "things": {
-      "command": "/path/to/your/home/.local/bin/things-mcp",
+      "command": "/path/to/your/home/things-mcp",
       "args": ["serve"]
     }
   }
@@ -50,5 +50,13 @@ Set your MCP client to launch the installed binary over stdio. Replace the comma
 ```
 
 Restart the client and ask the agent to list your Today tasks.
+
+## Uninstall
+
+For the default location, run this command. If you chose a different directory, use the full path printed by the installer.
+
+```sh
+rm -f "$HOME/things-mcp"
+```
 
 The Things Cloud protocol implementation draws on [things-cloud-sdk](https://github.com/pdurlej/things-cloud-sdk).

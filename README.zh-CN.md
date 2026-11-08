@@ -12,10 +12,10 @@
 在 macOS 或 Linux 上运行这一行。
 
 ```sh
-(cd "$HOME" && installer=$(curl -fsSL https://github.com/lxz2677/things-mcp/releases/latest/download/install.sh) && sh -c "$installer")
+(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && eval "$installer")
 ```
 
-安装器会选好对应的预编译包，校验 SHA-256，然后安装到 `~/.local/bin`。
+安装时可以输入目录，直接回车就使用 Home。无交互终端时也默认用 Home，自动安装可以通过 `THINGS_MCP_INSTALL_DIR` 指定目录。安装器会校验预编译包，并输出 `things-mcp` 的绝对路径。
 
 ### 让 Agent 安装
 
@@ -36,13 +36,13 @@
 
 ### 添加 MCP 服务
 
-在 MCP 客户端里添加 stdio 服务，把 `command` 换成你本机二进制的绝对路径。
+在 MCP 客户端里，把 `command` 设为安装器输出的绝对路径，参数填 `serve`。
 
 ```json
 {
   "mcpServers": {
     "things": {
-      "command": "/path/to/your/home/.local/bin/things-mcp",
+      "command": "/path/to/your/home/things-mcp",
       "args": ["serve"]
     }
   }
@@ -50,5 +50,13 @@
 ```
 
 重启客户端，请 Agent 列出你的 Today 任务。
+
+## 卸载
+
+默认安装位置用下面这条命令卸载。如果安装时选了其他目录，把命令里的路径换成安装器输出的绝对路径。
+
+```sh
+rm -f "$HOME/things-mcp"
+```
 
 Things Cloud 协议实现参考了 [things-cloud-sdk](https://github.com/pdurlej/things-cloud-sdk)。

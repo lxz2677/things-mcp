@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-: "${release_url:?Download install.sh from a things-mcp GitHub Release}"
+release_url=https://github.com/lxz2677/things-mcp/releases/latest/download
+cd "${HOME:?Set HOME to your home directory}" || exit 1
 
 case "$(uname -s)" in
   Darwin) platform=macos ;;
@@ -16,33 +17,44 @@ case "$(uname -m)" in
 esac
 
 archive="things-mcp-$platform-$arch.tar.gz"
-bin_dir="${HOME:?Set HOME to your home directory}/.local/bin"
-destination="$bin_dir/things-mcp"
+install_dir=${THINGS_MCP_INSTALL_DIR:-}
+if [ -z "$install_dir" ] && [ -t 0 ]; then
+  printf 'Install directory [%s]: ' "$HOME" >&2
+  IFS= read -r install_dir || exit 1
+fi
+install_dir=${install_dir:-$HOME}
+case "$install_dir" in
+  '~') install_dir="$HOME" ;;
+  '~/'*) install_dir="$HOME/${install_dir#'~/'}" ;;
+  /*) ;;
+  *) install_dir="$HOME/$install_dir" ;;
+esac
+mkdir -p "$install_dir" || exit 1
+cd -P "$install_dir" || exit 1
+
+destination="$PWD/things-mcp"
 if [ -d "$destination" ]; then
-  printf 'Choose a different location for the directory at %s.\n' "$destination" >&2
+  printf '%s is a directory. Move it before installing.\n' "$destination" >&2
   exit 1
 fi
-mkdir -p "$bin_dir"
-work_dir=$(mktemp -d "$bin_dir/.things-mcp.XXXXXX")
+work_dir=$(mktemp -d "$PWD/.things-mcp-install.XXXXXX") || exit 1
 trap 'rm -rf "$work_dir"' EXIT
 
-(
-  cd "$work_dir"
-  curl -fsSL --proto '=https' "$release_url/$archive" -o "$archive"
-  curl -fsSL --proto '=https' "$release_url/SHA256SUMS" -o SHA256SUMS
-  awk -v archive="$archive" '$2 == archive' SHA256SUMS > archive.sha256
-  if [ ! -s archive.sha256 ]; then
-    printf 'Missing SHA-256 checksum for %s.\n' "$archive" >&2
-    exit 1
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -c archive.sha256
-  else
-    shasum -a 256 -c archive.sha256
-  fi
-  tar -xzf "$archive" things-mcp
-  ./things-mcp --version
-)
+cd "$work_dir" || exit 1
+curl -fsSL --proto '=https' "$release_url/$archive" -o "$archive" &&
+  curl -fsSL --proto '=https' "$release_url/SHA256SUMS" -o SHA256SUMS &&
+  awk -v archive="$archive" '$2 == archive' SHA256SUMS > archive.sha256 || exit 1
+if [ ! -s archive.sha256 ]; then
+  printf 'Missing SHA-256 checksum for %s.\n' "$archive" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c archive.sha256
+else
+  shasum -a 256 -c archive.sha256
+fi || exit 1
 
-mv -f "$work_dir/things-mcp" "$destination"
+tar -xzf "$archive" things-mcp &&
+  ./things-mcp --version &&
+  mv -f things-mcp "$destination" || exit 1
 printf 'Installed %s\n' "$destination"
