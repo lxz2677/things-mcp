@@ -149,6 +149,8 @@ pub enum ThingsError {
     Server { status: u16, body: String },
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("commit conflict: {0}")]
+    Conflict(String),
     #[error("empty items page at index {cursor} while server head is {head}")]
     Stalled { cursor: usize, head: i64 },
     #[error(transparent)]
@@ -418,6 +420,7 @@ impl ThingsClient {
         path: &str,
         query: &[(&str, String)],
         body: Option<Vec<u8>>,
+        extra_headers: &[(&str, &str)],
     ) -> Result<RawReply, ThingsError> {
         let url = self.url(path, query);
 
@@ -440,6 +443,9 @@ impl ThingsClient {
                 "application/json; charset=UTF-8".to_string(),
             ));
             headers.push(("Content-Encoding".to_string(), "UTF-8".to_string()));
+        }
+        for (key, value) in extra_headers {
+            headers.push(((*key).to_string(), (*value).to_string()));
         }
 
         let mut attempt = 0u32;
@@ -480,7 +486,7 @@ impl ThingsClient {
     /// Validate credentials.
     pub async fn verify(&self) -> Result<AccountInfo, ThingsError> {
         let path = format!("/version/1/account/{}", self.options.email);
-        let reply = self.request("GET", &path, &[], None).await?;
+        let reply = self.request("GET", &path, &[], None, &[]).await?;
         serde_json::from_slice(&reply.body)
             .map_err(|error| ThingsError::Protocol(format!("account response: {error}")))
     }
@@ -505,14 +511,14 @@ impl ThingsClient {
 
     pub async fn own_history_key(&self) -> Result<OwnHistoryKey, ThingsError> {
         let path = format!("/version/1/account/{}/own-history-key", self.options.email);
-        let reply = self.request("GET", &path, &[], None).await?;
+        let reply = self.request("GET", &path, &[], None, &[]).await?;
         serde_json::from_slice(&reply.body)
             .map_err(|error| ThingsError::Protocol(format!("own-history-key response: {error}")))
     }
 
     pub async fn history_meta(&self, history_key: &str) -> Result<HistoryMeta, ThingsError> {
         let path = format!("/version/1/history/{history_key}");
-        let reply = self.request("GET", &path, &[], None).await?;
+        let reply = self.request("GET", &path, &[], None, &[]).await?;
         serde_json::from_slice(&reply.body)
             .map_err(|error| ThingsError::Protocol(format!("history response: {error}")))
     }
@@ -528,7 +534,7 @@ impl ThingsClient {
     ) -> Result<ItemsPage, ThingsError> {
         let path = format!("/version/1/history/{history_key}/items");
         let query = [("start-index", start_index.to_string())];
-        let reply = self.request("GET", &path, &query, None).await?;
+        let reply = self.request("GET", &path, &query, None, &[]).await?;
         let envelope: ItemsEnvelope = serde_json::from_slice(&reply.body)
             .map_err(|error| ThingsError::Protocol(format!("items response: {error}")))?;
 
@@ -582,8 +588,58 @@ impl ThingsClient {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitResult {
+    #[serde(
+        rename = "server-head-index",
+        default,
+        deserialize_with = "i64_or_zero"
+    )]
+    pub server_head_index: i64,
+}
+
+impl ThingsClient {
+    /// Push a change map: `{uuid: {"t": action, "e": kind, "p": payload}}`.
+    ///
+    /// `ancestor_index` is the history index this write is based on. After a
+    /// successful commit the server returns the new head; it must **not** be
+    /// used as the pull cursor (other devices may have written in between).
+    pub async fn commit(
+        &self,
+        history_key: &str,
+        ancestor_index: i64,
+        change_map: &Value,
+    ) -> Result<CommitResult, ThingsError> {
+        let path = format!("/version/1/history/{history_key}/commit");
+        let query = [
+            ("ancestor-index", ancestor_index.to_string()),
+            ("_cnt", "1".to_string()),
+        ];
+        let body = serde_json::to_vec(change_map)
+            .map_err(|error| ThingsError::Protocol(format!("encoding commit body: {error}")))?;
+
+        let reply = self
+            .request("POST", &path, &query, Some(body), &[("Push-Priority", "5")])
+            .await?;
+
+        serde_json::from_slice(&reply.body)
+            .map_err(|error| ThingsError::Protocol(format!("commit response: {error}")))
+    }
+}
+
 fn classify(reply: &RawReply, path: &str) -> Option<ThingsError> {
     let signal = reply.header("things-response").unwrap_or_default();
+    let body_text = reply.body_text();
+    let lower = body_text.to_lowercase();
+
+    // The backend signals a stale ancestor either with HTTP 409 or with an
+    // `OutdatedAncestor` marker in the body.
+    if reply.status == 409
+        || lower.contains("outdatedancestor")
+        || lower.contains("outdated ancestor")
+    {
+        return Some(ThingsError::Conflict(body_text));
+    }
 
     match signal {
         "Unauthorized" => return Some(ThingsError::Unauthorized),
@@ -766,6 +822,59 @@ mod tests {
         let info = client.verify().await.expect("retry must succeed");
         assert_eq!(info.email, "me@example.com");
         assert_eq!(*attempts.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_posts_the_change_map_with_the_ancestor_index() {
+        let fake = crate::testing::FakeTransport::new(|_request| {
+            RawReply::json(200, r#"{"server-head-index":171}"#)
+        });
+
+        let client = ThingsClient::new(
+            fake.clone(),
+            ClientOptions::new("me@example.com", "pw", "app"),
+        );
+
+        let change_map = serde_json::json!({
+            "uuid1": {"t": 0, "e": "Task7", "p": {"tt": "x"}}
+        });
+        let result = client.commit("HK", 170, &change_map).await.unwrap();
+        assert_eq!(result.server_head_index, 171);
+
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "POST");
+        assert!(
+            request
+                .url
+                .contains("/history/HK/commit?ancestor-index=170&_cnt=1"),
+            "url: {}",
+            request.url
+        );
+        let push_priority = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "Push-Priority")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(push_priority, Some("5"));
+
+        let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body, change_map);
+    }
+
+    #[tokio::test]
+    async fn commit_reports_conflicts() {
+        let fake = crate::testing::FakeTransport::new(|_request| {
+            RawReply::json(409, r#"{"error":"OutdatedAncestor"}"#)
+        });
+        let client = ThingsClient::new(fake, ClientOptions::new("me@example.com", "pw", "app"));
+
+        let error = client
+            .commit("HK", 1, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ThingsError::Conflict(_)), "{error}");
     }
 
     #[test]

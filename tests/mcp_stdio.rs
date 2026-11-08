@@ -66,6 +66,15 @@ fn stdio_server_lists_and_calls_tools() {
                 "method": "tools/call",
                 "params": {"name": "list_tasks", "arguments": {"list": "all"}}
             }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_task",
+                    "arguments": {"title": "preview", "dry_run": true}
+                }
+            }),
         ] {
             writeln!(stdin, "{line}").unwrap();
         }
@@ -75,7 +84,7 @@ fn stdio_server_lists_and_calls_tools() {
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
     let mut responses: Vec<Value> = Vec::new();
-    while responses.len() < 3 {
+    while responses.len() < 4 {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap() == 0 {
             break;
@@ -106,7 +115,7 @@ fn stdio_server_lists_and_calls_tools() {
         .find(|value| value["id"] == 2)
         .expect("tools/list response");
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 17, "tool count");
+    assert_eq!(tools.len(), 29, "tool count");
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -129,6 +138,18 @@ fn stdio_server_lists_and_calls_tools() {
         "get_tag",
         "sync_now",
         "sync_status",
+        "create_task",
+        "create_project",
+        "create_area",
+        "create_tag",
+        "update_task",
+        "complete_task",
+        "cancel_task",
+        "reopen_task",
+        "trash_task",
+        "restore_task",
+        "delete_task",
+        "add_checklist_item",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
@@ -140,4 +161,18 @@ fn stdio_server_lists_and_calls_tools() {
     let payload = &call["result"]["structuredContent"];
     assert_eq!(payload["count"], 2, "all list count: {payload}");
     assert_eq!(call["result"]["isError"], false);
+
+    let dry_run = responses
+        .iter()
+        .find(|value| value["id"] == 4)
+        .expect("create_task dry-run response");
+    let payload = &dry_run["result"]["structuredContent"];
+    assert_eq!(payload["status"], "dry-run");
+    assert_eq!(payload["pushed"], false);
+    assert_eq!(
+        payload["payload"].as_object().unwrap().len(),
+        34,
+        "dry-run must expose the 34-key snapshot"
+    );
+    assert_eq!(payload["payload"]["tt"], "preview");
 }

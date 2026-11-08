@@ -137,6 +137,16 @@ impl Store {
         self.meta_set("app_instance_id", value)
     }
 
+    /// Highest history index acknowledged by a commit (may be ahead of the
+    /// pull cursor, because we do not pull our own writes immediately).
+    pub fn commit_head(&self) -> Result<Option<i64>> {
+        meta_i64(&self.conn, "commit_head")
+    }
+
+    pub fn set_commit_head(&self, value: i64) -> Result<()> {
+        set_meta(&self.conn, "commit_head", &value.to_string())
+    }
+
     pub fn latest_server_index(&self) -> Result<Option<i64>> {
         meta_i64(&self.conn, "latest_server_index")
     }

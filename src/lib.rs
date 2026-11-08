@@ -16,3 +16,4 @@ pub mod store;
 pub mod sync;
 pub mod testing;
 pub mod things;
+pub mod write;

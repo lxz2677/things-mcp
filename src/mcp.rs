@@ -23,7 +23,10 @@ use crate::store::{
     list_tasks, project_detail, search_tasks, summaries, tag_detail, task_counts, task_detail,
 };
 use crate::sync::{SyncEngine, SyncReport};
-use crate::things::{ClientOptions, HttpTransport, ThingsClient, ThingsError};
+use crate::things::{
+    ClientOptions, HttpTransport, TaskDraft, ThingsClient, ThingsError, When, parse_day,
+};
+use crate::write::{TaskPatch, WriteService};
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
@@ -250,10 +253,150 @@ pub struct GetByIdArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTaskArgs {
+    /// Task title.
+    pub title: String,
+    /// Notes (plain text).
+    pub notes: Option<String>,
+    /// inbox | today | anytime | someday | evening | YYYY-MM-DD (default inbox).
+    pub when: Option<String>,
+    /// Deadline as YYYY-MM-DD.
+    pub deadline: Option<String>,
+    /// Project id (base58).
+    pub project_id: Option<String>,
+    /// Area id (base58).
+    pub area_id: Option<String>,
+    /// Heading id (base58).
+    pub heading_id: Option<String>,
+    /// Tag ids (base58).
+    pub tags: Option<Vec<String>>,
+    /// Preview the exact wire payload without writing (default false).
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateProjectArgs {
+    /// Project title.
+    pub title: String,
+    pub notes: Option<String>,
+    /// anytime | today | someday | YYYY-MM-DD (default anytime).
+    pub when: Option<String>,
+    pub deadline: Option<String>,
+    pub area_id: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateAreaArgs {
+    pub title: String,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTagArgs {
+    pub title: String,
+    pub parent_id: Option<String>,
+    pub shortcut: Option<String>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateTaskArgs {
+    /// Task id (base58).
+    pub id: String,
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    /// inbox | today | anytime | someday | evening | YYYY-MM-DD.
+    pub when: Option<String>,
+    pub deadline: Option<String>,
+    pub clear_deadline: Option<bool>,
+    pub project_id: Option<String>,
+    pub clear_project: Option<bool>,
+    pub area_id: Option<String>,
+    pub clear_area: Option<bool>,
+    pub heading_id: Option<String>,
+    pub clear_heading: Option<bool>,
+    pub tags: Option<Vec<String>>,
+    pub clear_tags: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IdDryRunArgs {
+    /// Entity id (base58).
+    pub id: String,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChecklistArgs {
+    /// Parent task id (base58).
+    pub task_id: String,
+    pub title: String,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SyncNowArgs {
     /// Discard the local replica and re-download the full history.
     #[serde(default)]
     pub full: bool,
+}
+
+impl ThingsServer {
+    /// Build a write service. Dry runs need no credentials and never touch the
+    /// network; real writes require `THINGS_ENABLE_WRITES=1`.
+    async fn write_service(&self, dry_run: bool) -> Result<WriteService, McpError> {
+        let store = self.open_store()?;
+        if dry_run {
+            let client = ThingsClient::new(
+                Arc::new(HttpTransport::new().map_err(internal)?),
+                ClientOptions::new("dry-run", "dry-run", "dry-run"),
+            );
+            return Ok(WriteService::new(SyncEngine::new(client, store), false));
+        }
+
+        if !crate::write::writes_enabled_from_env() {
+            return Err(McpError::internal_error(
+                "writes are disabled: set THINGS_ENABLE_WRITES=1 (dry_run is always allowed)",
+                Some(json!({"code": "WRITES_DISABLED"})),
+            ));
+        }
+
+        let client = self.build_client(&store)?;
+        client.login().await.map_err(things_error)?;
+        Ok(WriteService::from_env(SyncEngine::new(client, store)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draft_from(
+    title: String,
+    notes: Option<String>,
+    when: Option<String>,
+    deadline: Option<String>,
+    project: Option<String>,
+    area: Option<String>,
+    heading: Option<String>,
+    tags: Option<Vec<String>>,
+    task_type: i64,
+) -> Result<TaskDraft, McpError> {
+    let mut draft = TaskDraft::new(title);
+    draft.task_type = task_type;
+    draft.notes = notes.unwrap_or_default();
+    let default_when = if task_type == 1 { "anytime" } else { "inbox" };
+    draft.when = When::parse(when.as_deref().unwrap_or(default_when)).map_err(invalid_param)?;
+    draft.deadline = deadline
+        .as_deref()
+        .map(parse_day)
+        .transpose()
+        .map_err(invalid_param)?;
+    draft.project = project;
+    draft.area = area;
+    draft.heading = heading;
+    draft.tags = tags.unwrap_or_default();
+    Ok(draft)
 }
 
 #[tool_router]
@@ -528,6 +671,276 @@ impl ThingsServer {
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
+    #[tool(
+        description = "Create a task. Set dry_run=true to preview the exact 34-key wire payload without writing. Real writes require THINGS_ENABLE_WRITES=1."
+    )]
+    async fn create_task(
+        &self,
+        Parameters(args): Parameters<CreateTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let draft = draft_from(
+            args.title,
+            args.notes,
+            args.when,
+            args.deadline,
+            args.project_id,
+            args.area_id,
+            args.heading_id,
+            args.tags,
+            0,
+        )?;
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .create_task(draft, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Create a project. Same payload rules as create_task with type=project.")]
+    async fn create_project(
+        &self,
+        Parameters(args): Parameters<CreateProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let draft = draft_from(
+            args.title,
+            args.notes,
+            args.when,
+            args.deadline,
+            None,
+            args.area_id,
+            None,
+            args.tags,
+            1,
+        )?;
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .create_task(draft, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Create an area.")]
+    async fn create_area(
+        &self,
+        Parameters(args): Parameters<CreateAreaArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .create_area(&args.title, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Create a tag, optionally nested under parent_id.")]
+    async fn create_tag(
+        &self,
+        Parameters(args): Parameters<CreateTagArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .create_tag(
+                &args.title,
+                args.parent_id.as_deref(),
+                args.shortcut.as_deref(),
+                dry_run,
+            )
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(
+        description = "Update a task. Only the provided fields are sent as a minimal delta (plus md)."
+    )]
+    async fn update_task(
+        &self,
+        Parameters(args): Parameters<UpdateTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let deadline = if args.clear_deadline.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.deadline
+                .as_deref()
+                .map(parse_day)
+                .transpose()
+                .map_err(invalid_param)?
+                .map(Some)
+        };
+        let project = if args.clear_project.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.project_id.map(Some)
+        };
+        let area = if args.clear_area.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.area_id.map(Some)
+        };
+        let heading = if args.clear_heading.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.heading_id.map(Some)
+        };
+        let tags = if args.clear_tags.unwrap_or(false) {
+            Some(Vec::new())
+        } else {
+            args.tags
+        };
+
+        let patch = TaskPatch {
+            title: args.title,
+            notes: args.notes,
+            when: args
+                .when
+                .as_deref()
+                .map(When::parse)
+                .transpose()
+                .map_err(invalid_param)?,
+            deadline,
+            project,
+            area,
+            heading,
+            tags,
+        };
+
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .update_task(&args.id, patch, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Mark a task completed (ss=3, st=1, sp, md).")]
+    async fn complete_task(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .complete_task(&args.id, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Mark a task canceled (ss=2, sp, md).")]
+    async fn cancel_task(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .cancel_task(&args.id, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Reopen a completed or canceled task.")]
+    async fn reopen_task(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .reopen_task(&args.id, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Move a task to the trash (soft delete, tr=true).")]
+    async fn trash_task(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .trash_task(&args.id, false, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Restore a task from the trash.")]
+    async fn restore_task(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .trash_task(&args.id, true, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Permanently delete a task (t=2, empty payload). This cannot be undone.")]
+    async fn delete_task(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .delete_task(&args.id, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Add a checklist item to a task (ChecklistItem3, 9-key snapshot).")]
+    async fn add_checklist_item(
+        &self,
+        Parameters(args): Parameters<ChecklistArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .add_checklist_item(&args.task_id, &args.title, dry_run)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
     #[tool(description = "Pull changes from Things Cloud and update the local replica now.")]
     async fn sync_now(
         &self,
@@ -616,6 +1029,22 @@ fn not_found(kind: &str, id: &str) -> McpError {
     )
 }
 
+fn invalid_param(error: impl std::fmt::Display) -> McpError {
+    McpError::invalid_params(error.to_string(), None)
+}
+
+fn write_error(error: anyhow::Error) -> McpError {
+    let message = error.to_string();
+    let code = if message.contains("THINGS_ENABLE_WRITES") {
+        "WRITES_DISABLED"
+    } else if let Some(inner) = error.downcast_ref::<ThingsError>() {
+        code_of(inner)
+    } else {
+        "WRITE_FAILED"
+    };
+    McpError::internal_error(message, Some(json!({ "code": code })))
+}
+
 fn internal(error: impl std::fmt::Display) -> McpError {
     McpError::internal_error(error.to_string(), None)
 }
@@ -628,6 +1057,7 @@ fn code_of(error: &ThingsError) -> &'static str {
         ThingsError::Stalled { .. } => "SYNC_STALLED",
         ThingsError::Server { .. } => "SERVER_ERROR",
         ThingsError::Protocol(_) => "PROTOCOL_ERROR",
+        ThingsError::Conflict(_) => "SYNC_CONFLICT",
         ThingsError::Transport(_) => "NETWORK_ERROR",
     }
 }

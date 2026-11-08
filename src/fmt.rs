@@ -35,6 +35,16 @@ pub fn today_epoch_day() -> i64 {
     Local::now().date_naive().num_days_from_ce() as i64 - UNIX_EPOCH_CE
 }
 
+/// Current time as fractional Unix seconds (the wire format for `cd`/`md`).
+pub fn now_seconds() -> f64 {
+    Utc::now().timestamp_micros() as f64 / 1_000_000.0
+}
+
+/// Epoch day → Unix seconds of UTC midnight (the wire format for dates).
+pub fn day_to_wire(day: i64) -> i64 {
+    day * 86_400
+}
+
 pub fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }

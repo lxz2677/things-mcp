@@ -14,14 +14,11 @@ use things_mcp::store::{
     search_tasks, summaries, task_counts, task_detail,
 };
 use things_mcp::sync::SyncEngine;
-use things_mcp::things::{ClientOptions, HttpTransport, ThingsClient};
+use things_mcp::things::{ClientOptions, HttpTransport, TaskDraft, ThingsClient, When};
+use things_mcp::write::{TaskPatch, WriteService};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "things-mcp",
-    version,
-    about = "Headless Things Cloud client (read-only phase)"
-)]
+#[command(name = "things-mcp", version, about = "Headless Things Cloud client")]
 struct Cli {
     /// Things account email (defaults to THINGS_EMAIL).
     #[arg(long, global = true, env = "THINGS_EMAIL")]
@@ -126,6 +123,133 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Create a task. Requires THINGS_ENABLE_WRITES=1 unless --dry-run is used.
+    Create {
+        title: String,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long, default_value = "inbox")]
+        when: String,
+        #[arg(long)]
+        deadline: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long)]
+        heading: Option<String>,
+        #[arg(long = "tag")]
+        tag: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Create a project.
+    CreateProject {
+        title: String,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long, default_value = "anytime")]
+        when: String,
+        #[arg(long)]
+        deadline: Option<String>,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long = "tag")]
+        tag: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Create an area.
+    CreateArea {
+        title: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Create a tag.
+    CreateTag {
+        title: String,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        shortcut: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Update a task; only the provided fields are sent.
+    Update {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        when: Option<String>,
+        #[arg(long)]
+        deadline: Option<String>,
+        #[arg(long)]
+        clear_deadline: bool,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        clear_project: bool,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long)]
+        clear_area: bool,
+        #[arg(long)]
+        heading: Option<String>,
+        #[arg(long)]
+        clear_heading: bool,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long)]
+        clear_tags: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Mark a task completed (ss=3, st=1, sp, md).
+    Complete {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Mark a task canceled.
+    Cancel {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Reopen a completed/canceled task.
+    Reopen {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move a task to the trash (soft delete).
+    Trash {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restore a task from the trash.
+    Restore {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Hard delete a task (`t=2`, empty payload).
+    Delete {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Add a checklist item to a task.
+    Checklist {
+        task: String,
+        title: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run the MCP server over stdio.
     Serve {
         /// Seconds before a read tool triggers a background pull (0 = never).
@@ -180,6 +304,123 @@ async fn main() -> Result<()> {
         Command::Diagnose { json } => diagnose(&config, json),
         Command::Doctor { json } => doctor(&config, json),
         Command::Check { json } => check(&config, json).await,
+        Command::Create {
+            title,
+            notes,
+            when,
+            deadline,
+            project,
+            area,
+            heading,
+            tag,
+            dry_run,
+        } => {
+            write_create(
+                &config,
+                &title,
+                notes,
+                &when,
+                deadline.as_deref(),
+                project,
+                area,
+                heading,
+                tag,
+                0,
+                dry_run,
+            )
+            .await
+        }
+        Command::CreateProject {
+            title,
+            notes,
+            when,
+            deadline,
+            area,
+            tag,
+            dry_run,
+        } => {
+            write_create(
+                &config,
+                &title,
+                notes,
+                &when,
+                deadline.as_deref(),
+                None,
+                area,
+                None,
+                tag,
+                1,
+                dry_run,
+            )
+            .await
+        }
+        Command::CreateArea { title, dry_run } => write_create_area(&config, &title, dry_run).await,
+        Command::CreateTag {
+            title,
+            parent,
+            shortcut,
+            dry_run,
+        } => write_create_tag(&config, &title, parent, shortcut, dry_run).await,
+        Command::Update {
+            id,
+            title,
+            notes,
+            when,
+            deadline,
+            clear_deadline,
+            project,
+            clear_project,
+            area,
+            clear_area,
+            heading,
+            clear_heading,
+            tags,
+            clear_tags,
+            dry_run,
+        } => {
+            write_update(
+                &config,
+                &id,
+                title,
+                notes,
+                when,
+                deadline,
+                clear_deadline,
+                project,
+                clear_project,
+                area,
+                clear_area,
+                heading,
+                clear_heading,
+                tags,
+                clear_tags,
+                dry_run,
+            )
+            .await
+        }
+        Command::Complete { id, dry_run } => {
+            write_status(&config, &id, StatusAction::Complete, dry_run).await
+        }
+        Command::Cancel { id, dry_run } => {
+            write_status(&config, &id, StatusAction::Cancel, dry_run).await
+        }
+        Command::Reopen { id, dry_run } => {
+            write_status(&config, &id, StatusAction::Reopen, dry_run).await
+        }
+        Command::Trash { id, dry_run } => {
+            write_status(&config, &id, StatusAction::Trash, dry_run).await
+        }
+        Command::Restore { id, dry_run } => {
+            write_status(&config, &id, StatusAction::Restore, dry_run).await
+        }
+        Command::Delete { id, dry_run } => {
+            write_status(&config, &id, StatusAction::Delete, dry_run).await
+        }
+        Command::Checklist {
+            task,
+            title,
+            dry_run,
+        } => write_checklist(&config, &task, &title, dry_run).await,
         Command::Serve { refresh_secs } => things_mcp::mcp::run(config, refresh_secs).await,
     }
 }
@@ -196,6 +437,176 @@ fn init_tracing(verbose: u8) {
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
+}
+
+async fn write_service(config: &Config, dry_run: bool) -> Result<WriteService> {
+    let store = open_store(config)?;
+    if dry_run {
+        // Previewing a payload needs neither credentials nor the network.
+        let client = ThingsClient::new(
+            Arc::new(HttpTransport::new()?),
+            ClientOptions::new("dry-run", "dry-run", "dry-run"),
+        );
+        return Ok(WriteService::new(SyncEngine::new(client, store), false));
+    }
+
+    if !things_mcp::write::writes_enabled_from_env() {
+        bail!(
+            "writes are disabled: set THINGS_ENABLE_WRITES=1 to push changes (--dry-run is always allowed)"
+        );
+    }
+
+    let client = build_client(config, &store)?;
+    client.login().await.context("login failed")?;
+    Ok(WriteService::from_env(SyncEngine::new(client, store)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_create(
+    config: &Config,
+    title: &str,
+    notes: Option<String>,
+    when: &str,
+    deadline: Option<&str>,
+    project: Option<String>,
+    area: Option<String>,
+    heading: Option<String>,
+    tags: Vec<String>,
+    task_type: i64,
+    dry_run: bool,
+) -> Result<()> {
+    let mut draft = TaskDraft::new(title);
+    draft.task_type = task_type;
+    draft.notes = notes.unwrap_or_default();
+    draft.when = When::parse(when)?;
+    draft.deadline = deadline.map(things_mcp::things::parse_day).transpose()?;
+    draft.project = project;
+    draft.area = area;
+    draft.heading = heading;
+    draft.tags = tags;
+
+    let mut service = write_service(config, dry_run).await?;
+    let outcome = service.create_task(draft, dry_run).await?;
+    print_json(&outcome)
+}
+
+async fn write_create_area(config: &Config, title: &str, dry_run: bool) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.create_area(title, dry_run).await?)
+}
+
+async fn write_create_tag(
+    config: &Config,
+    title: &str,
+    parent: Option<String>,
+    shortcut: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(
+        &service
+            .create_tag(title, parent.as_deref(), shortcut.as_deref(), dry_run)
+            .await?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_update(
+    config: &Config,
+    id: &str,
+    title: Option<String>,
+    notes: Option<String>,
+    when: Option<String>,
+    deadline: Option<String>,
+    clear_deadline: bool,
+    project: Option<String>,
+    clear_project: bool,
+    area: Option<String>,
+    clear_area: bool,
+    heading: Option<String>,
+    clear_heading: bool,
+    tags: Vec<String>,
+    clear_tags: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let deadline = if clear_deadline {
+        Some(None)
+    } else {
+        deadline
+            .as_deref()
+            .map(things_mcp::things::parse_day)
+            .transpose()?
+            .map(Some)
+    };
+    let project = if clear_project {
+        Some(None)
+    } else {
+        project.map(Some)
+    };
+    let area = if clear_area {
+        Some(None)
+    } else {
+        area.map(Some)
+    };
+    let heading = if clear_heading {
+        Some(None)
+    } else {
+        heading.map(Some)
+    };
+    let tags = if clear_tags {
+        Some(Vec::new())
+    } else if tags.is_empty() {
+        None
+    } else {
+        Some(tags)
+    };
+
+    let patch = TaskPatch {
+        title,
+        notes,
+        when: when.as_deref().map(When::parse).transpose()?,
+        deadline,
+        project,
+        area,
+        heading,
+        tags,
+    };
+
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.update_task(id, patch, dry_run).await?)
+}
+
+#[derive(Clone, Copy)]
+enum StatusAction {
+    Complete,
+    Cancel,
+    Reopen,
+    Trash,
+    Restore,
+    Delete,
+}
+
+async fn write_status(
+    config: &Config,
+    id: &str,
+    action: StatusAction,
+    dry_run: bool,
+) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    let outcome = match action {
+        StatusAction::Complete => service.complete_task(id, dry_run).await?,
+        StatusAction::Cancel => service.cancel_task(id, dry_run).await?,
+        StatusAction::Reopen => service.reopen_task(id, dry_run).await?,
+        StatusAction::Trash => service.trash_task(id, false, dry_run).await?,
+        StatusAction::Restore => service.trash_task(id, true, dry_run).await?,
+        StatusAction::Delete => service.delete_task(id, dry_run).await?,
+    };
+    print_json(&outcome)
+}
+
+async fn write_checklist(config: &Config, task: &str, title: &str, dry_run: bool) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.add_checklist_item(task, title, dry_run).await?)
 }
 
 fn open_store(config: &Config) -> Result<Store> {

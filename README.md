@@ -2,7 +2,7 @@
 
 一个 **Rust 写的 Things Cloud 无头客户端**，最终以 MCP Server 形态给 Agent 用。
 
-当前进度：**Phase 0+1（只读）完成** —— 认证、分页拉取、Task7 wire 解码、SQLite 副本、列表/搜索查询、CLI 验证命令，以及 **stdio MCP server（17 个读工具）**。真实账号对拍待跑。
+当前进度：**Phase 0+1（只读）已验收 + Phase 2 写路径已实现**（34 键金标准编码、安全闸、`POST /commit`、dry-run、MCP 29 个工具）。写操作的真实账号端到端验收待跑。
 
 设计依据：本地的 6 份方案文档 + `things4Android-share-20261108/reverse-engineering/` 的抓包实证（这些材料未随仓库发布）。实现逻辑参照 [pdurlej/things-cloud-sdk](https://github.com/pdurlej/things-cloud-sdk)，但把它的 `Task6` 协议升级到当前云端在用的 `Task7`。
 
@@ -63,6 +63,7 @@ TLS 使用 `rustls` + `ring`（纯 Rust），根证书走平台信任库；构�
 | `THINGS_PASSWORD` | 密码（也接受 `THINGS_TOKEN`；**不落盘、不写日志**） |
 | `THINGS_DB` | SQLite 路径。默认：macOS `~/Library/Application Support/things-mcp/things.sqlite`、Linux `$XDG_DATA_HOME/things-mcp/things.sqlite`、Windows `%APPDATA%\things-mcp\things.sqlite` |
 | `THINGS_BASE_URL` | 覆盖云端地址（测试用） |
+| `THINGS_ENABLE_WRITES` | `1`/`true`/`yes`/`on` 才允许真实推送；未设置时只能 `--dry-run` |
 | `RUST_LOG` | 日志级别（输出到 stderr） |
 
 ## 用法
@@ -90,6 +91,17 @@ cargo run --release -- list tag-<id>
 cargo run --release -- search "发票" --project <id>
 cargo run --release -- show <task-id>
 
+# 写操作预览（不需要凭据、不联网、不写库）
+cargo run --release -- create "买牛奶" --when today --notes "两盒" --dry-run
+
+# 真实写入（需要 THINGS_ENABLE_WRITES=1）
+export THINGS_ENABLE_WRITES=1
+cargo run --release -- create "买牛奶" --when today
+cargo run --release -- update <id> --title "新标题" --when tomorrow
+cargo run --release -- complete <id>
+cargo run --release -- trash <id>
+cargo run --release -- delete <id>
+
 # 账号信息
 cargo run --release -- account
 
@@ -101,7 +113,7 @@ cargo run --release -- serve
 
 ## MCP server
 
-`things-mcp serve` 通过 stdio 提供 17 个只读工具：
+`things-mcp serve` 通过 stdio 提供 29 个工具（17 个读 + 12 个写）：
 
 | 工具 | 说明 |
 |---|---|
@@ -120,6 +132,13 @@ cargo run --release -- serve
 | `get_tag` | 标签详情：父标签、子标签、带该标签的任务 |
 | `sync_now` | 立即拉取（`full: true` 可全量重来） |
 | `sync_status` | history key、游标、上次同步、各列表计数 |
+| `create_task` / `create_project` / `create_area` / `create_tag` | 创建实体（34/4/5 键快照） |
+| `update_task` | 最小增量更新（title/notes/when/deadline/容器/标签） |
+| `complete_task` / `cancel_task` / `reopen_task` | 完成 / 取消 / 重新打开 |
+| `trash_task` / `restore_task` / `delete_task` | 软删 / 恢复 / 硬删 |
+| `add_checklist_item` | 添加清单项（9 键快照） |
+
+写工具都支持 `dry_run: true`：只返回将要推送的精确 payload，不联网、不写库。
 
 行为说明：
 
@@ -147,6 +166,16 @@ Claude Desktop / Cursor 配置示例（`claude_desktop_config.json`）：
 
 > 密码放在客户端配置里不是最佳实践；更稳的做法是让客户端继承 shell 环境变量，或用系统的 secret 管理器注入。
 
+## 写路径安全模型
+
+1. **金标准校验**：Task7 create 必须包含全部 34 键（ChecklistItem3 = 9、Area3 = 4、Tag4 = 5），且类型正确；缺一即拒绝推送
+2. **dry-run 零副作用**：不需要凭据，不联网，不写 SQLite
+3. **环境开关**：`THINGS_ENABLE_WRITES=1` 才允许真实 commit；默认关闭
+4. **先推送后落库**：commit 成功后才应用到本地副本，避免「本地有、云端无」
+5. **冲突重试**：commit 返回 `OutdatedAncestor` → 先增量拉取再重试一次
+6. **最小增量**：update 只发变化字段；只有内容/状态变化才带 `md`，纯排序不带
+7. **游标不跳**：commit 后不推进 pull 游标（只记 `commit_head`），下次拉取仍会重放自己的写入（幂等）
+
 ## 结构
 
 ```
@@ -160,7 +189,7 @@ src/
 │   ├── schema.sql       # SQLite schema（可查询列 + raw JSON）
 │   ├── mod.rs           # 打开/迁移、原子 apply_page、meta
 │   └── query.rs         # 列表语义、搜索、项目/区域/标签、详情
-├── mcp.rs               # stdio MCP server：14 个只读工具
+├── mcp.rs               # stdio MCP server：17 读 + 12 写工具
 ├── sync.rs              # 分页拉取、游标、并发接管、历史重置
 ├── testing.rs           # FakeTransport（测试用）
 └── things/
@@ -182,7 +211,7 @@ src/
 cargo test
 ```
 
-覆盖：Task7 解码、notes 字节补丁（含 emoji/中文边界）、分页（**截断页**、head 边界、stalled、历史重置）、游标并发接管、列表互斥性、搜索、字段级合并，**完整历史重放**（create/update/notes 补丁/硬删/tombstone/Settings）、认证回退（raw → percent-encode）、429 重试、历史 key 轮换、双连接并发写入，以及**真实二进制**的 stdio MCP 端到端（`tools/list` 17 个工具 + `tools/call`）。
+覆盖：Task7 解码、notes 字节补丁（含 emoji/中文边界）、分页（**截断页**、head 边界、stalled、历史重置）、游标并发接管、列表互斥性、搜索、字段级合并，**完整历史重放**（create/update/notes 补丁/硬删/tombstone/Settings）、认证回退（raw → percent-encode）、429 重试、历史 key 轮换、双连接并发写入，以及**真实二进制**的 stdio MCP 端到端（`tools/list` 29 个工具 + 读/写 `tools/call`，写操作用 dry-run）。
 
 另有一个需联网的 TLS 冒烟测试（默认 ignored）：
 
@@ -203,9 +232,10 @@ no-op: PASS    data stable: PASS    audit: PASS
 
 ## 下一步
 
-1. **真实账号对拍**：`sync --full` 后跑 `verify`，把 Inbox/Today/Upcoming/Anytime/Someday/Logbook 的计数与 Mac 上 Things 对齐；不一致就调 `src/store/query.rs` 的列表条件
-2. Phase 2：写工具（`create_task` / `update_task` / `complete_task` / `cancel_task` / `trash_task` / `move_task` / `add_checklist`），写库 + operation_log
-3. Phase 3：金标准 34 键安全闸 + `POST /commit` 推送 + 三方合并
+1. **写路径真机验收**：先 `--dry-run` 看 payload，再创建一条一次性任务，确认 Mac/iOS 能正常显示且不崩；然后 complete → trash → delete，最后跑 `check`
+2. **operation_log + 三方合并**：多端同时编辑时的字段级 LWW、离线优先、撤销
+3. **重复规则写入**：`set_repeat` / `clear_repeat`（`rr`/`rp` 双写）
+4. **移动/排序**：`move_task`（项目/区域/分节 + 索引重排）、`set_index`
 
 ## 免责声明
 

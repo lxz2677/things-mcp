@@ -44,6 +44,10 @@ impl SyncEngine {
         Self { client, store }
     }
 
+    pub fn client(&self) -> &ThingsClient {
+        &self.client
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }
