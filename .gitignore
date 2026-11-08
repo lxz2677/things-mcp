@@ -1,0 +1,6 @@
+/target
+/things.sqlite
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.cargo-home/
