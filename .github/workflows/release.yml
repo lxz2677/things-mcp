@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: things-mcp-macos-arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: things-mcp-macos-x86_64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: things-mcp-linux-arm64
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: things-mcp-linux-x86_64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Test, build, and package
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          cargo test --locked --release --target "$TARGET"
+          cargo build --locked --release --target "$TARGET"
+          binary_dir="target/$TARGET/release"
+          "$binary_dir/things-mcp" --version
+          mkdir -p dist
+          tar -czf "dist/$ASSET.tar.gz" -C "$binary_dir" things-mcp
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: things-mcp-*
+          path: dist
+          merge-multiple: true
+      - name: Publish archives, checksums, and installer
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          shopt -s nullglob
+          archives=(things-mcp-*.tar.gz)
+          if (( ${#archives[@]} != 4 )); then
+            echo "::error::Expected four release archives."
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+
+          tag="$GITHUB_REF_NAME"
+          tag_path=$(jq -nr --arg tag "$tag" '$tag | @uri')
+          {
+            printf '#!/bin/sh\nrelease_url=%q\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$tag_path"
+            tail -n +2 ../scripts/install.sh
+          } > install.sh
+          assets=("${archives[@]}" SHA256SUMS install.sh)
+
+          prerelease=false
+          if [[ "$tag" == *-* ]]; then
+            prerelease=true
+          fi
+
+          if release=$(gh release view "$tag" --json isDraft,assets 2>/dev/null); then
+            if ! jq -e '.isDraft' <<<"$release" >/dev/null; then
+              for asset in "${assets[@]}"; do
+                if ! jq -e --arg name "$asset" '.assets | any(.name == $name)' <<<"$release" >/dev/null; then
+                  echo "::error::Release $tag is already published and is missing $asset."
+                  exit 1
+                fi
+              done
+              echo "Release $tag is already published with all assets."
+              exit 0
+            fi
+          else
+            gh release create "$tag" --verify-tag --generate-notes --draft "--prerelease=$prerelease"
+          fi
+
+          gh release upload "$tag" --clobber "${assets[@]}"
+          gh release edit "$tag" --draft=false "--prerelease=$prerelease"
