@@ -50,18 +50,29 @@ TLS 使用 `rustls` + `ring`（纯 Rust），根证书走平台信任库；构�
 
 ## 跨平台
 
-- **纯 Rust**：不需要 Things.app、AppleScript、macOS API；Linux / macOS / Windows 都能跑
-- **唯一的平台分支**是默认数据目录：macOS `~/Library/Application Support/things-mcp/`、Linux `$XDG_DATA_HOME/things-mcp/`、Windows `%APPDATA%\\things-mcp\\`，都可用 `THINGS_DB` 覆盖
+- 支持 macOS 和 Linux。CI 在 macOS 和 Ubuntu 上运行 `cargo test`。
 - 协议里的 `App-Id: com.culturedcode.ThingsMac`、`User-Agent: ThingsMac/...`、`Things-Client-Info` 里的 `on: macOS` 是**客户端身份标识**（模拟官方 Mac 客户端），不是运行时依赖
-- CI 在 Ubuntu / macOS / Windows 三个平台上跑 `cargo test`
 
 ## 配置
+
+在 `~/.things-mcp/credentials.json` 保存 Things Cloud 的邮箱和密码。macOS 和 Linux 都从 `$HOME` 找到这个文件。
+
+```json
+{
+  "email": "you@example.com",
+  "password": "your-things-cloud-password"
+}
+```
+
+密码以明文保存在文件中。macOS 和 Linux 上可用 `chmod 600` 将文件访问权限限制为当前用户。
+
+环境变量仍可使用。显式传入邮箱或密码时，请成对提供，程序会跳过文件。使用测试地址时也通过环境变量提供测试凭据。文件路径独立于 `THINGS_DB`。
 
 | 环境变量 | 用途 |
 |---|---|
 | `THINGS_EMAIL` | 账号邮箱（也接受 `THINGS_USERNAME`） |
-| `THINGS_PASSWORD` | 密码（也接受 `THINGS_TOKEN`；**不落盘、不写日志**） |
-| `THINGS_DB` | SQLite 路径。默认：macOS `~/Library/Application Support/things-mcp/things.sqlite`、Linux `$XDG_DATA_HOME/things-mcp/things.sqlite`、Windows `%APPDATA%\things-mcp\things.sqlite` |
+| `THINGS_PASSWORD` | 密码（也接受 `THINGS_TOKEN`） |
+| `THINGS_DB` | SQLite 路径。macOS 默认 `~/Library/Application Support/things-mcp/things.sqlite`，Linux 默认 `$XDG_DATA_HOME/things-mcp/things.sqlite`（未设置时用 `~/.local/share`）。 |
 | `THINGS_BASE_URL` | 覆盖云端地址（测试用） |
 | `RUST_LOG` | 日志级别（输出到 stderr） |
 
@@ -144,25 +155,18 @@ cargo run --release -- serve
 - 没有配置凭据时自动进入**本地只读模式**，不访问网络。
 - 输出同时带 `structuredContent` 和文本；列表结果含 `total` / `has_more`，便于分页。
 
-Claude Desktop / Cursor 配置示例（`claude_desktop_config.json`）：
+保存 `credentials.json` 后，MCP 客户端只需要配置启动命令。
 
 ```json
 {
   "mcpServers": {
     "things": {
       "command": "/absolute/path/to/things-mcp/target/release/things-mcp",
-      "args": ["serve"],
-      "env": {
-        "THINGS_EMAIL": "you@example.com",
-        "THINGS_PASSWORD": "your-password",
-        "THINGS_DB": "/Users/you/Library/Application Support/things-mcp/things.sqlite"
-      }
+      "args": ["serve"]
     }
   }
 }
 ```
-
-> 密码放在客户端配置里不是最佳实践；更稳的做法是让客户端继承 shell 环境变量，或用系统的 secret 管理器注入。
 
 ## 写路径安全模型
 

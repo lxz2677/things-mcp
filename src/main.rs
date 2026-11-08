@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    let config = Config::from_env(cli.email.clone(), cli.base_url.clone(), cli.db.clone())?;
+    let config = Config::load(cli.email.clone(), cli.base_url.clone(), cli.db.clone())?;
 
     match cli.command {
         Command::Account { json } => account(&config, json).await,
