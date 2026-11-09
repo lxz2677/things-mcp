@@ -2,6 +2,11 @@
 
 Add each release under a `## vX.Y.Z` heading. The release workflow uses that section as the GitHub Release description.
 
+## v0.3.1
+
+- Fix a full-sync failure on older replicas where the column order could trigger `NOT NULL constraint failed: task.instance_creation_paused`.
+- Clear the local cache and sync cursor on first use after upgrading. The next sync rebuilds the cache from Things Cloud. Later starts of the same version reuse the rebuilt cache.
+
 ## v0.3.0
 
 - Create, change, and clear repeat rules on tasks and projects through the CLI and MCP. Rules support daily, weekly, monthly, yearly, and after-completion schedules, with intervals, selected weekdays, and optional end dates. Updates that set a repeat rule require a start date. The end date cannot precede the first scheduled occurrence or the start date of an after-completion rule.

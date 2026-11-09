@@ -1,6 +1,6 @@
 [package]
 name = "things-mcp"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Headless Things Cloud client exposed as an MCP server"
 license = "MIT"
