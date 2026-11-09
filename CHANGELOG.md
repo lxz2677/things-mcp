@@ -2,6 +2,12 @@
 
 Add each release under a `## vX.Y.Z` heading. The release workflow uses that section as the GitHub Release description.
 
+## Unreleased
+
+- Detect incompatible Things Cloud versions at sync time: `schema` must be 301, entity generations are capped at Task7/Area3/Tag4/ChecklistItem3/Settings5/Tombstone2, and unknown entity kinds or item actions fail the sync.
+- The compatibility state is persisted. Every CLI/MCP data operation then returns an `INCOMPATIBLE_VERSION` warning and stops without touching the replica; `sync`, `verify`, `doctor`, and `account` remain available to re-check after upgrading.
+- `verify`, `doctor`, and `sync_status` show the compatibility state and the last check time; `doctor` adds a `compat.status` audit check.
+
 ## v0.2.1
 
 - Set a local reminder time (`HH:MM`) when creating or updating a task or project with a start date. Use `--remind` in the CLI or `reminder` in MCP. For example, create a task with `--when tomorrow --remind 09:00`.
