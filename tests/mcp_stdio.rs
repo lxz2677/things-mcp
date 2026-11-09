@@ -88,7 +88,7 @@ fn stdio_server_lists_and_calls_tools() {
                 "method": "tools/call",
                 "params": {
                     "name": "create_task",
-                    "arguments": {"title": "preview", "reminder": "09:00", "dry_run": true}
+                    "arguments": {"title": "preview", "when": "tomorrow", "reminder": "09:00", "dry_run": true}
                 }
             }),
             json!({
@@ -215,6 +215,7 @@ fn stdio_server_lists_and_calls_tools() {
     );
     assert_eq!(payload["payload"]["tt"], "preview");
     assert_eq!(payload["payload"]["ato"], 32_400);
+    assert!(payload["payload"]["sr"].is_i64());
 
     let area = responses
         .iter()

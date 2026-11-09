@@ -149,7 +149,6 @@ pub fn parse_reminder(value: &str) -> Result<i64> {
 
 /// Format seconds since local midnight as `HH:MM`.
 pub fn format_reminder(seconds: i64) -> String {
-    let seconds = seconds.rem_euclid(86_400);
     format!("{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60)
 }
 
@@ -366,7 +365,7 @@ pub fn validate_task_create(payload: &Value) -> Result<()> {
     }
     require_nullable_number(obj, "cd", false)?;
     for key in [
-        "md", "sp", "lai", "sr", "dd", "dds", "tir", "icsd", "acrd", "rmd", "ato",
+        "md", "sp", "lai", "sr", "dd", "dds", "tir", "icsd", "acrd", "rmd",
     ] {
         require_nullable_number(obj, key, true)?;
     }
@@ -375,6 +374,16 @@ pub fn validate_task_create(payload: &Value) -> Result<()> {
         if !(value.is_null() || value.is_object()) {
             bail!("{key} must be null or a recurrence object");
         }
+    }
+    if !obj["ato"].is_null() {
+        anyhow::ensure!(
+            super::wire::reminder_offset(&obj["ato"]).is_some(),
+            "reminder time must be a whole number of seconds between 0 and 86399"
+        );
+        anyhow::ensure!(
+            !obj["sr"].is_null() || !obj["rr"].is_null(),
+            "a reminder requires a start date; set when to today, tomorrow, evening, or YYYY-MM-DD"
+        );
     }
     if obj["nt"].get("v").and_then(Value::as_str).is_none() {
         bail!("nt must be a note object with a string `v`");
@@ -531,6 +540,10 @@ mod tests {
         let mut draft = TaskDraft::new("remind me");
         draft.reminder_time = Some(parse_reminder("09:00").unwrap());
 
+        let undated = task_create_payload(&draft, today(), 1_700_000_000.0);
+        assert!(validate_task_create(&undated).is_err());
+
+        draft.when = When::Today;
         let payload = task_create_payload(&draft, today(), 1_700_000_000.0);
         assert_eq!(payload["ato"], 32_400);
         validate_task_create(&payload).unwrap();

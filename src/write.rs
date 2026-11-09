@@ -158,6 +158,8 @@ impl WriteService {
                 patch.heading.as_ref().and_then(|id| id.as_deref()),
             )?;
             let mut delta = Map::new();
+            let mut reminder_time = patch.reminder_time;
+            let has_reminder_date;
 
             if let Some(title) = &patch.title
                 && *title != existing.title
@@ -175,11 +177,33 @@ impl WriteService {
                 delta.insert("sr".into(), json!(sr.map(fmt::day_to_wire)));
                 delta.insert("tir".into(), json!(tir.map(fmt::day_to_wire)));
                 delta.insert("sb".into(), json!(sb));
+                has_reminder_date = sr.is_some();
+                if !has_reminder_date
+                    && (existing.reminder_time.is_some()
+                        || existing.raw.get("rmd").is_some_and(|value| !value.is_null()))
+                {
+                    reminder_time.get_or_insert(None);
+                }
+            } else {
+                has_reminder_date =
+                    existing.start_date.is_some() || existing.recurrence_rule.is_some();
             }
             if let Some(deadline) = patch.deadline {
                 delta.insert("dd".into(), json!(deadline.map(fmt::day_to_wire)));
             }
-            if let Some(reminder) = patch.reminder_time {
+            if let Some(reminder) = reminder_time {
+                if let Some(seconds) = reminder {
+                    anyhow::ensure!(
+                        (0..86_400).contains(&seconds),
+                        "reminder time must be between 0 and 86399 seconds"
+                    );
+                    anyhow::ensure!(
+                        has_reminder_date,
+                        "a reminder requires a start date; set when to today, tomorrow, evening, or YYYY-MM-DD"
+                    );
+                } else if existing.raw.get("rmd").is_some_and(|value| !value.is_null()) {
+                    delta.insert("rmd".into(), Value::Null);
+                }
                 delta.insert("ato".into(), json!(reminder));
             }
             if let Some(project) = &patch.project {
@@ -882,7 +906,7 @@ mod tests {
         let mut service = WriteService::live(engine_with(fake.clone(), vec![]));
 
         let mut draft = TaskDraft::new("remind me");
-        draft.when = When::Anytime;
+        draft.when = When::Today;
         draft.reminder_time = Some(encode::parse_reminder("09:00").unwrap());
 
         let outcome = service.create_task(draft).await.unwrap();
@@ -895,10 +919,10 @@ mod tests {
     #[tokio::test]
     async fn update_reminder_sends_only_ato_and_md() {
         let fake = fake_ok(1);
-        let mut service = WriteService::live(engine_with(
-            fake.clone(),
-            vec![task_item("task-1", "t", vec![])],
-        ));
+        let mut task = task_item("task-1", "t", vec![]);
+        task.props.insert("st".into(), json!(2));
+        task.props.insert("sr".into(), json!(1_800_057_600));
+        let mut service = WriteService::live(engine_with(fake.clone(), vec![task]));
 
         let patch = TaskPatch {
             reminder_time: Some(Some(56_700)),
@@ -922,10 +946,10 @@ mod tests {
     #[tokio::test]
     async fn clear_reminder_sends_null() {
         let fake = fake_ok(1);
-        let mut service = WriteService::live(engine_with(
-            fake.clone(),
-            vec![task_item("task-1", "t", vec![])],
-        ));
+        let mut task = task_item("task-1", "t", vec![]);
+        task.props.insert("ato".into(), json!(32_400));
+        task.props.insert("rmd".into(), json!(1_800_090_000));
+        let mut service = WriteService::live(engine_with(fake.clone(), vec![task]));
 
         let patch = TaskPatch {
             reminder_time: Some(None),
@@ -934,7 +958,8 @@ mod tests {
         service.update_task("task-1", patch).await.unwrap();
 
         let payload = last_commit_payload(&fake, "task-1");
-        assert!(payload["ato"].is_null());
+        assert_eq!(payload.get("ato"), Some(&Value::Null));
+        assert_eq!(payload.get("rmd"), Some(&Value::Null));
         assert_eq!(
             live_store(&service)
                 .get_task("task-1")

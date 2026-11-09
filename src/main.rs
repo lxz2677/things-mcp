@@ -142,7 +142,7 @@ enum Command {
         heading: Option<String>,
         #[arg(long = "tag")]
         tag: Vec<String>,
-        /// Reminder time in local time, HH:MM.
+        /// Reminder time in local time, HH:MM. Requires a dated --when.
         #[arg(long)]
         remind: Option<String>,
         #[arg(long)]
@@ -161,7 +161,7 @@ enum Command {
         area: Option<String>,
         #[arg(long = "tag")]
         tag: Vec<String>,
-        /// Reminder time in local time, HH:MM.
+        /// Reminder time in local time, HH:MM. Requires a dated --when.
         #[arg(long)]
         remind: Option<String>,
         #[arg(long)]
@@ -252,7 +252,7 @@ enum Command {
         tags: Vec<String>,
         #[arg(long)]
         clear_tags: bool,
-        /// Reminder time in local time, HH:MM.
+        /// Reminder time in local time, HH:MM. The item needs a start date.
         #[arg(long)]
         remind: Option<String>,
         #[arg(long)]

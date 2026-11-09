@@ -81,7 +81,7 @@ impl Store {
         Ok(Some(Self { conn }))
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(10))?;
         // WAL lets a long-running MCP server and ad-hoc CLI runs share the file.
         // journal_mode returns a row, so it has to go through execute_batch.
@@ -91,33 +91,27 @@ impl Store {
              PRAGMA temp_store=MEMORY;
              PRAGMA foreign_keys=OFF;",
         )?;
-        let existing: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if existing > SCHEMA_VERSION {
-            anyhow::bail!(
-                "database schema version {existing} is newer than supported ({SCHEMA_VERSION}); update things-mcp"
-            );
-        }
+        if schema_version(&conn)? < SCHEMA_VERSION {
+            // Serialize upgrades and check again after taking the lock: the CLI
+            // or MCP server may already have migrated the same replica.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if schema_version(&tx)? < SCHEMA_VERSION {
+                tx.execute_batch(include_str!("schema.sql"))?;
 
-        conn.execute_batch(include_str!("schema.sql"))?;
-
-        // v2: reminder time (seconds since local midnight, wire `ato`).
-        // Kept idempotent because `user_version` may still be 0 on very old files.
-        let added_reminder_column = !column_exists(&conn, "task", "reminder_time")?;
-        if added_reminder_column {
-            conn.execute("ALTER TABLE task ADD COLUMN reminder_time INTEGER", [])?;
-        }
-        if existing < 2 || added_reminder_column {
-            // Backfill from the raw wire properties so existing replicas get
-            // their reminders without a full re-pull.
-            conn.execute(
-                "UPDATE task SET reminder_time = json_extract(raw, '$.ato')
-                 WHERE json_type(raw, '$.ato') = 'integer'",
-                [],
-            )?;
-        }
-
-        if existing < SCHEMA_VERSION {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                // v2: backfill reminders from the raw wire properties without
+                // replaying history. Very old files may still be at version 0.
+                if !column_exists(&tx, "task", "reminder_time")? {
+                    tx.execute("ALTER TABLE task ADD COLUMN reminder_time INTEGER", [])?;
+                }
+                tx.execute(
+                    "UPDATE task SET reminder_time = json_extract(raw, '$.ato')
+                     WHERE json_type(raw, '$.ato') = 'integer'
+                       AND json_extract(raw, '$.ato') BETWEEN 0 AND 86399",
+                    [],
+                )?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            tx.commit()?;
         }
         Ok(Self { conn })
     }
@@ -616,6 +610,18 @@ fn get_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
 }
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    let raw: serde_json::Map<String, Value> = row
+        .get::<_, String>("raw")
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let reminder_time = match row.get("reminder_time") {
+        // A dry run may read a v1 replica without upgrading it.
+        Err(rusqlite::Error::InvalidColumnName(_)) => {
+            raw.get("ato").and_then(wire::reminder_offset)
+        }
+        result => result?,
+    };
     Ok(Task {
         id: row.get("id")?,
         kind: row.get("kind")?,
@@ -628,7 +634,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         user_modification_date: row.get("user_modification_date")?,
         stop_date: row.get("stop_date")?,
         last_reminder_interaction_date: row.get("last_reminder_interaction_date")?,
-        reminder_time: row.get::<_, Option<i64>>("reminder_time").ok().flatten(),
+        reminder_time,
         start: row.get("start")?,
         start_date: row.get("start_date")?,
         start_bucket: row.get("start_bucket")?,
@@ -653,11 +659,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         experimental: row
             .get::<_, Option<String>>("experimental")?
             .and_then(|text| serde_json::from_str(&text).ok()),
-        raw: row
-            .get::<_, String>("raw")
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default(),
+        raw,
     })
 }
 
@@ -724,6 +726,15 @@ fn save_task(conn: &Connection, task: &Task) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn schema_version(conn: &Connection) -> Result<i64> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    anyhow::ensure!(
+        version <= SCHEMA_VERSION,
+        "database schema version {version} is newer than supported ({SCHEMA_VERSION}); update things-mcp"
+    );
+    Ok(version)
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -942,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_databases_to_add_reminder_time() {
+    fn reads_and_migrates_v1_reminders_with_concurrent_opens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.sqlite");
 
@@ -965,30 +976,29 @@ mod tests {
                 .unwrap();
         }
 
-        let store = Store::open(&path).unwrap();
-        let columns: i64 = store
-            .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('task') WHERE name = 'reminder_time'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(columns, 1);
-        let backfilled: i64 = store
-            .connection()
-            .query_row(
-                "SELECT reminder_time FROM task WHERE id = 't1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(backfilled, 41_400);
-        let version: i64 = store
-            .connection()
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        {
+            let preview = Store::open_read_only(&path).unwrap().unwrap();
+            assert_eq!(
+                preview.get_task("t1").unwrap().unwrap().reminder_time,
+                Some(41_400)
+            );
+            assert_eq!(schema_version(preview.connection()).unwrap(), 1);
+        }
+
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let open_and_check = || {
+                start.wait();
+                let store = Store::open(&path).unwrap();
+                assert_eq!(
+                    store.get_task("t1").unwrap().unwrap().reminder_time,
+                    Some(41_400)
+                );
+                assert_eq!(schema_version(store.connection()).unwrap(), SCHEMA_VERSION);
+            };
+            scope.spawn(open_and_check);
+            scope.spawn(open_and_check);
+        });
     }
 
     #[test]

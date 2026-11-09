@@ -96,8 +96,10 @@ pub fn audit(conn: &Connection) -> Result<Vec<CheckResult>> {
         (
             "decode.reminder",
             "SELECT id FROM task
-             WHERE json_type(raw, '$.ato') IS NOT NULL
-               AND reminder_time IS NOT json_extract(raw, '$.ato')",
+             WHERE reminder_time IS NOT CASE
+                       WHEN json_type(raw, '$.ato') = 'integer'
+                        AND json_extract(raw, '$.ato') BETWEEN 0 AND 86399
+                       THEN json_extract(raw, '$.ato') END",
         ),
         (
             "decode.notes",

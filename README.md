@@ -6,7 +6,7 @@ English · [简体中文](README.zh-CN.md) · [Changelog](CHANGELOG.md)
 
 - Browse tasks, projects, areas, tags, and checklists. Search task titles and notes.
 - Create and update tasks, organize them into projects and areas, and mark them complete.
-- Set or clear task reminders with a local `HH:MM` time.
+- Set or clear reminders for tasks and projects with a start date, using a local `HH:MM` time.
 - Create, rename, and delete tags and areas, and move tags under a different parent. Write tools support `dry_run: true` to preview changes.
 
 ## Install
@@ -73,6 +73,8 @@ Use the absolute path printed by the installer as the MCP command and pass the `
 ```
 
 Restart the client and ask the agent to list your Today tasks.
+
+To set a reminder, give the item a start date. For example, run `things-mcp create "Call Sam" --when tomorrow --remind 09:00`, or pass `when: "tomorrow"` and `reminder: "09:00"` to the MCP tool `create_task`. Use `update --clear-remind` in the CLI or `clear_reminder: true` in `update_task` to remove it.
 
 ## Uninstall
 

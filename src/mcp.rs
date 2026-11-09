@@ -273,7 +273,7 @@ pub struct CreateTaskArgs {
     pub heading_id: Option<String>,
     /// Tag ids (base58).
     pub tags: Option<Vec<String>>,
-    /// Reminder time in local time, `HH:MM` (wire `ato`).
+    /// Reminder time in local time, `HH:MM`. Requires a dated `when`.
     pub reminder: Option<String>,
     /// Preview the exact wire payload without writing (default false).
     pub dry_run: Option<bool>,
@@ -289,7 +289,7 @@ pub struct CreateProjectArgs {
     pub deadline: Option<String>,
     pub area_id: Option<String>,
     pub tags: Option<Vec<String>>,
-    /// Reminder time in local time, `HH:MM` (wire `ato`).
+    /// Reminder time in local time, `HH:MM`. Requires a dated `when`.
     pub reminder: Option<String>,
     pub dry_run: Option<bool>,
 }
@@ -350,7 +350,7 @@ pub struct UpdateTaskArgs {
     pub clear_heading: Option<bool>,
     pub tags: Option<Vec<String>>,
     pub clear_tags: Option<bool>,
-    /// Reminder time in local time, `HH:MM` (wire `ato`).
+    /// Reminder time in local time, `HH:MM`. The item needs a start date.
     pub reminder: Option<String>,
     pub clear_reminder: Option<bool>,
     pub dry_run: Option<bool>,

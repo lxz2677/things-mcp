@@ -30,6 +30,12 @@ fn int(value: &Value) -> Option<i64> {
     }
 }
 
+pub(crate) fn reminder_offset(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .filter(|seconds| (0..86_400).contains(seconds))
+}
+
 fn boolean(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),
@@ -166,7 +172,7 @@ pub fn apply_task(task: &mut Task, props: &Map<String, Value>) {
     // `ato` is the reminder time as seconds since local midnight (the upstream
     // docs mis-label it as afterCompletionReference; `acrd` is that field).
     if props.contains_key("ato") {
-        task.reminder_time = props.get("ato").and_then(int);
+        task.reminder_time = props.get("ato").and_then(reminder_offset);
     }
 
     if let Some(value) = opt_day(props, "sr") {

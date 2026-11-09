@@ -6,7 +6,7 @@
 
 - 浏览任务、项目、区域、标签和清单，搜索任务标题和备注。
 - 创建和更新任务，将任务归入项目和区域，或标记完成。
-- 用本地时间 `HH:MM` 设置或清除任务提醒。
+- 为有开始日期的任务和项目设置或清除提醒，时间使用本地 `HH:MM` 格式。
 - 创建、重命名和删除标签与区域，也可以调整标签的父级。写入工具支持用 `dry_run: true` 预览变更。
 
 ## 安装
@@ -73,6 +73,8 @@
 ```
 
 重启客户端，请 Agent 列出你的 Today 任务。
+
+设置提醒时，任务或项目需要有开始日期。例如，运行 `things-mcp create "打电话" --when tomorrow --remind 09:00`，或在 MCP 的 `create_task` 工具中传入 `when: "tomorrow"` 和 `reminder: "09:00"`。要清除提醒，用 CLI 的 `update --clear-remind`，或在 `update_task` 中传入 `clear_reminder: true`。
 
 ## 卸载
 

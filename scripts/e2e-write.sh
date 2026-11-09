@@ -49,11 +49,36 @@ assert task["title"] == "E2E task", task
 assert task["status"] == sys.argv[1], task
 ' "$1"
 }
+assert_reminder() {
+  reader sync
+  reader show "$id" | python3 -c '
+import json, sys
+task = json.load(sys.stdin)
+assert task["reminder"] == (sys.argv[1] or None), task
+' "$1"
+}
 
 "$BIN" sync --full
-id="$("$BIN" create "E2E task" --when anytime --notes "e2e probe" |
+id="$("$BIN" create "E2E task" --when tomorrow --remind 09:00 --notes "e2e probe" |
   python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])')"
 assert_status open
+assert_reminder 09:00
+
+"$BIN" update "$id" --remind 15:45
+assert_reminder 15:45
+
+"$BIN" update "$id" --clear-remind
+assert_reminder ''
+
+"$BIN" update "$id" --remind 00:00
+assert_reminder 00:00
+"$BIN" update "$id" --when anytime
+assert_reminder ''
+if "$BIN" update "$id" --remind 09:00 >"$test_dir/undated-update" 2>&1; then
+  echo "setting a reminder without a start date unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -Fq 'a reminder requires a start date' "$test_dir/undated-update"
 
 "$BIN" complete "$id"
 assert_status completed

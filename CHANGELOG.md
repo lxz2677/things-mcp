@@ -2,11 +2,11 @@
 
 Add each release under a `## vX.Y.Z` heading. The release workflow uses that section as the GitHub Release description.
 
-## Unreleased
+## v0.2.1
 
-- Set or clear task reminders. `create_task` / `create_project` accept `reminder: "HH:MM"`; `update_task` accepts `reminder` or `clear_reminder`. The CLI uses `--remind` and `--clear-remind`.
-- The wire field is `ato` (seconds since local midnight). Existing replicas are migrated and backfilled from the raw history on first open.
-- List and task detail output include the reminder time; `doctor` validates the decode against the raw `ato` value.
+- Set a local reminder time (`HH:MM`) when creating or updating a task or project with a start date. Use `--remind` in the CLI or `reminder` in MCP. For example, create a task with `--when tomorrow --remind 09:00`.
+- Clear a reminder with `--clear-remind` or `clear_reminder: true`. Removing the start date also clears its reminder.
+- Task lists and details show reminder times. Existing local databases pick up previously synced reminders on first open without a full sync, and `doctor` checks that the stored times match the synced data.
 
 ## v0.2.0
 
