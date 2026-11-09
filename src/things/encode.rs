@@ -100,7 +100,7 @@ pub struct TaskDraft {
     pub task_type: i64,
     /// Reminder time as seconds since local midnight (wire `ato`).
     pub reminder_time: Option<i64>,
-    /// Repeater rule object; encoded into both `rr` and `rp`.
+    /// Legacy recurrence rule object for `rr`.
     pub repeater: Option<Value>,
     pub index: i64,
     pub today_index: i64,
@@ -196,7 +196,7 @@ fn default_interval() -> u32 {
     1
 }
 
-/// User-facing recurrence description, mapped to the wire `rr`/`rp` object.
+/// User-facing recurrence description, mapped to the wire `rr` object.
 #[derive(Debug, Clone, serde::Serialize, Deserialize, JsonSchema)]
 pub struct RepeatSpec {
     #[serde(rename = "type", default)]
@@ -505,7 +505,7 @@ fn first_yearly(start: NaiveDate, month: u32, day: i32) -> Result<i64> {
     bail!("could not compute the first yearly occurrence")
 }
 
-/// Validate a wire `rr`/`rp` object before it can be pushed.
+/// Validate a wire `rr` object before it can be pushed.
 pub fn validate_repeater(rule: &Value) -> Result<()> {
     let obj = rule.as_object().context("repeater must be an object")?;
     for key in ["ia", "rrv", "fu", "ts", "sr", "rc", "fa", "tp", "of", "ed"] {
@@ -593,7 +593,7 @@ pub fn task_create_payload(draft: &TaskDraft, today: i64, now: f64) -> Value {
         "ar": ids_vec(&draft.area),
         "tg": draft.tags,
         "rr": draft.repeater.clone().unwrap_or(Value::Null),
-        "rp": draft.repeater.clone().unwrap_or(Value::Null),
+        "rp": Value::Null,
         "rt": [],
         "lai": Value::Null,
         "icc": 0,
@@ -757,12 +757,11 @@ pub fn validate_task_create(payload: &Value) -> Result<()> {
     ] {
         require_nullable_number(obj, key, true)?;
     }
-    for key in ["rr", "rp"] {
-        let value = &obj[key];
-        if !(value.is_null() || value.is_object()) {
-            bail!("{key} must be null or a recurrence object");
-        }
-    }
+    anyhow::ensure!(
+        obj["rr"].is_null() || obj["rr"].is_object(),
+        "rr must be null or a recurrence object"
+    );
+    anyhow::ensure!(obj["rp"].is_null(), "rp must be null in Task7 creates");
     if !obj["ato"].is_null() {
         anyhow::ensure!(
             super::wire::reminder_offset(&obj["ato"]).is_some(),
@@ -1185,6 +1184,14 @@ mod tests {
         let mut payload = task_create_payload(&TaskDraft::new("x"), today(), 1.0);
         payload["tr"] = json!("yes");
         assert!(validate_task_create(&payload).is_err());
+    }
+
+    #[test]
+    fn safety_gate_rejects_non_null_rp_on_create() {
+        let mut payload = task_create_payload(&TaskDraft::new("x"), today(), 1.0);
+        payload["rp"] = json!({"rrv": 4});
+        let error = validate_task_create(&payload).unwrap_err();
+        assert_eq!(error.to_string(), "rp must be null in Task7 creates");
     }
 
     #[test]

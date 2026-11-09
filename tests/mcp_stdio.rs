@@ -92,7 +92,7 @@ fn stdio_server_lists_and_calls_tools() {
                         "title": "preview",
                         "when": "tomorrow",
                         "reminder": "09:00",
-                        "repeat": {"frequency": "weekly", "weekdays": ["mon"]},
+                        "repeat": {"frequency": "daily"},
                         "dry_run": true
                     }
                 }
@@ -234,12 +234,9 @@ fn stdio_server_lists_and_calls_tools() {
     );
     assert_eq!(payload["payload"]["tt"], "preview");
     assert_eq!(payload["payload"]["ato"], 32_400);
-    assert_eq!(payload["payload"]["rr"], payload["payload"]["rp"]);
-    assert_eq!(payload["payload"]["rr"]["fu"], 256);
-    assert_eq!(
-        payload["payload"]["st"], 2,
-        "an undated repeat is auto-scheduled"
-    );
+    assert_eq!(payload["payload"].get("rp"), Some(&Value::Null));
+    assert_eq!(payload["payload"]["rr"]["fu"], 16);
+    assert_eq!(payload["payload"]["st"], 2, "a dated repeat is scheduled");
     assert!(payload["payload"]["sr"].is_i64());
 
     let area = responses

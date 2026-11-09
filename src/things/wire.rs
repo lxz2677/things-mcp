@@ -210,8 +210,8 @@ pub fn apply_task(task: &mut Task, props: &Map<String, Value>) {
         task.repeating_template = value;
     }
 
-    // `rr` and `rp` carry the same repeater; keep the raw object verbatim so a
-    // future write path can re-emit both keys without re-encoding losses.
+    // Prefer the legacy rule in `rr`. Keep `rp` as a fallback for incoming
+    // payloads that omit `rr`.
     if props.contains_key("rr") {
         task.recurrence_rule = props
             .get("rr")

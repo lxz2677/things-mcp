@@ -2,6 +2,10 @@
 
 Add each release under a `## vX.Y.Z` heading. The release workflow uses that section as the GitHub Release description.
 
+## v0.3.2
+
+- Write new and updated repeat rules only to `rr`. Keep `rp` null on creation and omit it when setting a rule on an existing task or project. This avoids a Things sync error that could show a misleading update prompt.
+
 ## v0.3.1
 
 - Fix a full-sync failure on older replicas where the column order could trigger `NOT NULL constraint failed: task.instance_creation_paused`.

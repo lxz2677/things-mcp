@@ -338,9 +338,7 @@ impl WriteService {
                                 "task has no start date; pass a dated `when` with the repeat rule"
                             )
                         })?;
-                        let rule = spec.build(start)?;
-                        delta.insert("rr".into(), rule.clone());
-                        delta.insert("rp".into(), rule);
+                        delta.insert("rr".into(), spec.build(start)?);
                     }
                     None => {
                         delta.insert("rr".into(), Value::Null);
@@ -1272,7 +1270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_with_repeat_sends_rr_and_rp() {
+    async fn create_with_repeat_sends_rr_and_null_rp() {
         use crate::things::encode;
 
         let fake = fake_ok(1);
@@ -1285,7 +1283,7 @@ mod tests {
 
         let outcome = service.create_task(draft).await.unwrap();
         let payload = last_commit_payload(&fake, &outcome.id);
-        assert_eq!(payload["rr"], payload["rp"], "rr and rp must be identical");
+        assert_eq!(payload.get("rp"), Some(&Value::Null));
         assert_eq!(payload["icp"], false);
         assert_eq!(payload["rr"]["fu"], 256);
         assert_eq!(payload["rr"]["ia"], crate::fmt::day_to_wire(start));
@@ -1298,7 +1296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_repeat_sends_rr_rp_and_md() {
+    async fn update_repeat_sends_rr_and_md() {
         use crate::things::encode;
 
         let fake = fake_ok(1);
@@ -1315,10 +1313,10 @@ mod tests {
         service.update_task("task-1", patch).await.unwrap();
 
         let payload = last_commit_payload(&fake, "task-1");
-        assert_eq!(payload["rr"], payload["rp"]);
+        assert!(payload.get("rp").is_none());
         assert_eq!(payload["rr"]["fu"], 256);
         assert!(payload["md"].is_number());
-        assert_eq!(payload.as_object().unwrap().len(), 3);
+        assert_eq!(payload.as_object().unwrap().len(), 2);
         assert!(
             live_store(&service)
                 .get_task("task-1")
@@ -1338,8 +1336,9 @@ mod tests {
         let mut item = task_item("task-1", "t", vec![]);
         item.props.insert("sr".into(), json!(fmt::day_to_wire(day)));
         item.props.insert("st".into(), json!(2));
-        item.props
-            .insert("rr".into(), weekly_spec().build(day).unwrap());
+        let rule = weekly_spec().build(day).unwrap();
+        item.props.insert("rr".into(), rule.clone());
+        item.props.insert("rp".into(), rule);
         let mut service = WriteService::live(engine_with(fake.clone(), vec![item]));
 
         let patch = TaskPatch {
@@ -1349,8 +1348,8 @@ mod tests {
         service.update_task("task-1", patch).await.unwrap();
 
         let payload = last_commit_payload(&fake, "task-1");
-        assert!(payload["rr"].is_null());
-        assert!(payload["rp"].is_null());
+        assert_eq!(payload.get("rr"), Some(&Value::Null));
+        assert_eq!(payload.get("rp"), Some(&Value::Null));
         assert!(
             live_store(&service)
                 .get_task("task-1")
