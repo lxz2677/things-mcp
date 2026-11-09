@@ -119,6 +119,63 @@ async fn second_sync_is_a_noop() {
 }
 
 #[tokio::test]
+async fn replays_a_daily_repeat_after_discarding_a_legacy_replica() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy.sqlite");
+    {
+        let store = Store::open(&path).unwrap();
+        store.set_history_key("HK").unwrap();
+        store.set_cursor(1).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "ALTER TABLE task DROP COLUMN reminder_time;
+                 ALTER TABLE task ADD COLUMN reminder_time INTEGER;
+                 INSERT INTO task (id) VALUES ('stale');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.cursor().unwrap(), 0);
+    assert_eq!(store.task_count().unwrap(), 0);
+    let cloud = FakeTransport::new(|request| {
+        if request.url.ends_with("start-index=0") {
+            return RawReply::json(
+                200,
+                r#"{"items":[{"daily":{"t":0,"e":"Task7","p":{
+                    "tt":"Daily repeat","tp":0,"st":2,"ss":0,"sr":1794268800,
+                    "ato":32400,"rr":{"fu":16,"fa":1}
+                }}}],"current-item-index":1,"schema":301}"#,
+            );
+        }
+        if request.url.ends_with("/own-history-key") {
+            return RawReply::json(200, OWN);
+        }
+        RawReply::json(
+            200,
+            r#"{"latest-server-index":1,"latest-schema-version":301}"#,
+        )
+    });
+    let mut engine = SyncEngine::new(client(cloud.clone()), store);
+
+    let report = engine.sync(false).await.unwrap();
+    assert_eq!(report.cursor, 1);
+    let task = engine.store().get_task("daily").unwrap().unwrap();
+    assert!(!task.instance_creation_paused);
+    assert_eq!(task.instance_creation_start_date, None);
+    assert_eq!(task.reminder_time, Some(32_400));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(task.recurrence_rule.as_deref().unwrap())
+            .unwrap(),
+        serde_json::json!({"fu": 16, "fa": 1})
+    );
+    assert_eq!(engine.sync(false).await.unwrap().pages, 0);
+    assert_eq!(engine.sync(true).await.unwrap().cursor, 1);
+    assert_eq!(items_starts(&cloud), vec![0, 0]);
+}
+
+#[tokio::test]
 async fn resets_when_cursor_is_ahead_of_the_server() {
     let fake = fake(5);
     let store = Store::open_in_memory().unwrap();

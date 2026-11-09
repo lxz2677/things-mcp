@@ -34,8 +34,17 @@ use crate::things::model::{Area, ChecklistItem, EntityKind, Tag, Task};
 use crate::things::wire;
 use crate::things::{ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem, ThingsError};
 
-/// Bump when adding tables/columns; `init` applies migrations for older files.
-const SCHEMA_VERSION: i64 = 2;
+/// Bump when changing the replica schema.
+const SCHEMA_VERSION: i64 = 3;
+const REPLICA_VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPLICA_TABLES: [&str; 6] = [
+    "task",
+    "area",
+    "tag",
+    "checklist_item",
+    "task_tag",
+    "area_tag",
+];
 
 pub struct Store {
     conn: Connection,
@@ -90,7 +99,7 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    /// Read the compatibility state without creating or migrating the database.
+    /// Read the compatibility state without creating or rebuilding the database.
     pub fn read_compat(path: &Path) -> Result<Option<CompatStatus>> {
         match Self::open_read_only(path)? {
             Some(store) => Ok(Some(store.compat()?)),
@@ -105,6 +114,10 @@ impl Store {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(10))?;
+        anyhow::ensure!(
+            replica_is_current(&conn)?,
+            "local replica needs to be rebuilt; run `things-mcp sync` first"
+        );
         Ok(Some(Self { conn }))
     }
 
@@ -118,24 +131,18 @@ impl Store {
              PRAGMA temp_store=MEMORY;
              PRAGMA foreign_keys=OFF;",
         )?;
-        if schema_version(&conn)? < SCHEMA_VERSION {
-            // Serialize upgrades and check again after taking the lock: the CLI
-            // or MCP server may already have migrated the same replica.
+        if !replica_is_current(&conn)? {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if schema_version(&tx)? < SCHEMA_VERSION {
-                tx.execute_batch(include_str!("schema.sql"))?;
-
-                // v2: backfill reminders from the raw wire properties without
-                // replaying history. Very old files may still be at version 0.
-                if !column_exists(&tx, "task", "reminder_time")? {
-                    tx.execute("ALTER TABLE task ADD COLUMN reminder_time INTEGER", [])?;
+            // Both the CLI and MCP server may open the same old replica.
+            if !replica_is_current(&tx)? {
+                for table in REPLICA_TABLES {
+                    tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
                 }
-                tx.execute(
-                    "UPDATE task SET reminder_time = json_extract(raw, '$.ato')
-                     WHERE json_type(raw, '$.ato') = 'integer'
-                       AND json_extract(raw, '$.ato') BETWEEN 0 AND 86399",
-                    [],
-                )?;
+                tx.execute_batch(include_str!("schema.sql"))?;
+                let generation = meta_i64(&tx, "sync_generation")?.unwrap_or(0) + 1;
+                tx.execute("DELETE FROM meta WHERE key != 'app_instance_id'", [])?;
+                set_meta(&tx, "sync_generation", &generation.to_string())?;
+                set_meta(&tx, "replica_version", REPLICA_VERSION)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             tx.commit()?;
@@ -150,12 +157,7 @@ impl Store {
     // ----------------------------------------------------------------- meta
 
     pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()?)
+        meta_get(&self.conn, key)
     }
 
     pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
@@ -236,11 +238,6 @@ impl Store {
         record_compat_check(&tx, check, Some(reason), false)?;
         tx.commit()?;
         Ok(())
-    }
-
-    pub(crate) fn needs_compat_replay(&self, state: &SyncState) -> Result<bool> {
-        Ok((state.cursor > 0 || state.commit_head.unwrap_or(0) > 0)
-            && self.meta_get("compat_history_validated")?.is_none())
     }
 
     /// Refuse to touch the replica when the last sync found a newer cloud
@@ -412,14 +409,7 @@ impl Store {
                 "replica changed during the rebuild; retry the operation"
             );
             record_compat_check(&tx, check, None, true)?;
-            for table in [
-                "task",
-                "area",
-                "tag",
-                "checklist_item",
-                "task_tag",
-                "area_tag",
-            ] {
+            for table in REPLICA_TABLES {
                 tx.execute_batch(&format!(
                     "DELETE FROM main.{table};
                      INSERT INTO main.{table} SELECT * FROM staged.{table};"
@@ -430,7 +420,8 @@ impl Store {
                     'history_key', 'processed_remote_index', 'schema',
                     'latest_server_index', 'last_sync_at', 'commit_head'
                  );
-                 INSERT INTO main.meta SELECT * FROM staged.meta;",
+                 INSERT INTO main.meta SELECT * FROM staged.meta
+                 WHERE key IN ('history_key', 'processed_remote_index');",
             )?;
             set_meta(
                 &tx,
@@ -611,8 +602,6 @@ fn record_compat_check(
             "compat_block_revision",
             &(block_revision + 1).to_string(),
         )?;
-    } else {
-        set_meta(tx, "compat_history_validated", "1")?;
     }
     Ok(())
 }
@@ -661,13 +650,16 @@ fn check_generation(conn: &Connection, history_key: &str, generation: i64) -> Re
     Ok(())
 }
 
-fn meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>> {
+fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
-            row.get::<_, String>(0)
+            row.get(0)
         })
-        .optional()?
-        .and_then(|value| value.parse::<i64>().ok()))
+        .optional()?)
+}
+
+fn meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    Ok(meta_get(conn, key)?.and_then(|value| value.parse().ok()))
 }
 
 fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
@@ -823,13 +815,6 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
-    let reminder_time = match row.get("reminder_time") {
-        // A dry run may read a v1 replica without upgrading it.
-        Err(rusqlite::Error::InvalidColumnName(_)) => {
-            raw.get("ato").and_then(wire::reminder_offset)
-        }
-        result => result?,
-    };
     Ok(Task {
         id: row.get("id")?,
         kind: row.get("kind")?,
@@ -842,7 +827,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         user_modification_date: row.get("user_modification_date")?,
         stop_date: row.get("stop_date")?,
         last_reminder_interaction_date: row.get("last_reminder_interaction_date")?,
-        reminder_time,
+        reminder_time: row.get("reminder_time")?,
         start: row.get("start")?,
         start_date: row.get("start_date")?,
         start_bucket: row.get("start_bucket")?,
@@ -945,15 +930,9 @@ fn schema_version(conn: &Connection) -> Result<i64> {
     Ok(version)
 }
 
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+fn replica_is_current(conn: &Connection) -> Result<bool> {
+    Ok(schema_version(conn)? == SCHEMA_VERSION
+        && meta_get(conn, "replica_version")?.as_deref() == Some(REPLICA_VERSION))
 }
 
 fn replace_task_tags(conn: &Connection, task: &Task) -> Result<()> {
@@ -1161,12 +1140,15 @@ mod tests {
     }
 
     #[test]
-    fn reads_and_migrates_v1_reminders_with_concurrent_opens() {
+    fn rebuilds_an_old_replica_once_with_concurrent_opens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.sqlite");
 
         {
             let store = Store::open(&path).unwrap();
+            store.set_app_instance_id("existing-client").unwrap();
+            store.set_history_key("old-history").unwrap();
+            store.set_cursor(5).unwrap();
             store
                 .connection()
                 .execute(
@@ -1184,29 +1166,68 @@ mod tests {
                 .unwrap();
         }
 
-        {
-            let preview = Store::open_read_only(&path).unwrap().unwrap();
-            assert_eq!(
-                preview.get_task("t1").unwrap().unwrap().reminder_time,
-                Some(41_400)
-            );
-            assert_eq!(schema_version(preview.connection()).unwrap(), 1);
-        }
+        let error = Store::open_read_only(&path)
+            .err()
+            .expect("read-only open must not rebuild");
+        assert!(error.to_string().contains("run `things-mcp sync`"));
+        assert_eq!(
+            schema_version(&Connection::open(&path).unwrap()).unwrap(),
+            1
+        );
 
         let start = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
             let open_and_check = || {
                 start.wait();
                 let store = Store::open(&path).unwrap();
+                assert_eq!(store.task_count().unwrap(), 0);
+                assert_eq!(store.cursor().unwrap(), 0);
+                assert_eq!(store.history_key().unwrap(), None);
                 assert_eq!(
-                    store.get_task("t1").unwrap().unwrap().reminder_time,
-                    Some(41_400)
+                    store.app_instance_id().unwrap().as_deref(),
+                    Some("existing-client")
                 );
                 assert_eq!(schema_version(store.connection()).unwrap(), SCHEMA_VERSION);
             };
             scope.spawn(open_and_check);
             scope.spawn(open_and_check);
         });
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.meta_get("replica_version").unwrap().as_deref(),
+            Some(REPLICA_VERSION)
+        );
+        assert_eq!(store.sync_state().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn a_new_binary_version_rebuilds_even_when_the_schema_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            store.meta_set("replica_version", "0.0.0").unwrap();
+            store.set_cursor(5).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.cursor().unwrap(), 0);
+            store
+                .connection()
+                .execute("INSERT INTO task (id) VALUES ('fresh')", [])
+                .unwrap();
+            store.set_cursor(10).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.cursor().unwrap(), 10);
+        assert!(
+            !store
+                .get_task("fresh")
+                .unwrap()
+                .unwrap()
+                .instance_creation_paused
+        );
     }
 
     #[test]

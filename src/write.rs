@@ -1286,11 +1286,13 @@ mod tests {
         let outcome = service.create_task(draft).await.unwrap();
         let payload = last_commit_payload(&fake, &outcome.id);
         assert_eq!(payload["rr"], payload["rp"], "rr and rp must be identical");
+        assert_eq!(payload["icp"], false);
         assert_eq!(payload["rr"]["fu"], 256);
         assert_eq!(payload["rr"]["ia"], crate::fmt::day_to_wire(start));
         assert_eq!(payload["rr"]["of"], json!([{"wd": 1}, {"wd": 3}]));
 
         let task = live_store(&service).get_task(&outcome.id).unwrap().unwrap();
+        assert!(!task.instance_creation_paused);
         let stored: Value = serde_json::from_str(task.recurrence_rule.as_deref().unwrap()).unwrap();
         assert_eq!(stored["fu"], 256);
     }

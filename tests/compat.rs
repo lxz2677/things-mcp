@@ -6,7 +6,7 @@ use std::sync::Arc;
 use things_mcp::store::Store;
 use things_mcp::sync::SyncEngine;
 use things_mcp::testing::FakeTransport;
-use things_mcp::things::{ClientOptions, IncomingItem, RawReply, ThingsClient, ThingsError};
+use things_mcp::things::{ClientOptions, RawReply, ThingsClient, ThingsError};
 
 const OWN: &str =
     r#"{"history-key":"HK","is-empty":false,"latest-schema-version":301,"latest-server-index":1}"#;
@@ -27,7 +27,14 @@ fn client(fake: Arc<FakeTransport>) -> ThingsClient {
 }
 
 fn engine(meta_schema: i64, page_schema: i64, item: &'static str) -> SyncEngine {
-    let fake = FakeTransport::new(move |request| {
+    SyncEngine::new(
+        client(fake_cloud(meta_schema, page_schema, item)),
+        Store::open_in_memory().unwrap(),
+    )
+}
+
+fn fake_cloud(meta_schema: i64, page_schema: i64, item: &'static str) -> Arc<FakeTransport> {
+    FakeTransport::new(move |request| {
         let url = &request.url;
         if url.ends_with("/own-history-key") {
             return RawReply::json(200, OWN);
@@ -39,8 +46,7 @@ fn engine(meta_schema: i64, page_schema: i64, item: &'static str) -> SyncEngine 
             return RawReply::json(200, meta(meta_schema));
         }
         RawReply::json(404, "{}")
-    });
-    SyncEngine::new(client(fake), Store::open_in_memory().unwrap())
+    })
 }
 
 #[tokio::test]
@@ -190,35 +196,31 @@ fn empty_history_meta(schema: i64) -> String {
 
 #[tokio::test]
 async fn revalidates_history_even_at_the_cloud_head_on_upgrade() {
-    let mut engine = engine(
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica.sqlite");
+    {
+        let store = Store::open(&path).unwrap();
+        store.set_history_key("HK").unwrap();
+        store.set_cursor(1).unwrap();
+        store.meta_set("compat_status", "ok").unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO task (id, kind) VALUES ('u', 'Task8');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+    }
+    let fake = fake_cloud(
         301,
         301,
         r#"{"u":{"t":0,"e":"Task8","p":{"tt":"from cloud"}}}"#,
     );
-    let store = engine.store_mut();
-    store.set_history_key("HK").unwrap();
-    store.meta_set("compat_status", "ok").unwrap(); // Set by the old incremental check.
-    store
-        .apply_page(
-            0,
-            &[IncomingItem {
-                uuid: "u".into(),
-                action: 0,
-                kind: "Task8".into(),
-                props: serde_json::from_str(r#"{"tt":"legacy copy"}"#).unwrap(),
-                server_index: 0,
-            }],
-            1,
-        )
-        .unwrap()
-        .unwrap();
+    let mut engine = SyncEngine::new(client(fake), Store::open(&path).unwrap());
 
     let error = engine.sync(false).await.unwrap_err();
     assert!(error.to_string().contains("Task8"), "{error}");
     assert!(engine.store().ensure_compatible().is_err());
-    assert_eq!(engine.store().cursor().unwrap(), 1);
-    assert_eq!(
-        engine.store().get_task("u").unwrap().unwrap().title,
-        "legacy copy"
-    );
+    assert_eq!(engine.store().cursor().unwrap(), 0);
+    assert!(engine.store().get_task("u").unwrap().is_none());
 }

@@ -88,7 +88,7 @@
 
 一旦发现更新：sync 立即停止并把状态写入本地；之后 MCP 的所有数据操作会返回 **工具结果**（`isError: true`）并带上结构化的 `INCOMPATIBLE_VERSION`（含 `message`、`do_not_retry`、`remediation`），Agent 可以直接读到并停止；CLI 数据命令以错误退出。两者都不会读写副本。`sync`、`verify`、`doctor`、`account` 仍可运行，方便升级后重新检测。`verify`、`doctor`、`sync_status` 会显示上次检测结果。
 
-同步时执行检测。写操作会先同步，因此能在提交前拦截不兼容的版本。旧副本首次同步时会重放历史，验证后再标记为兼容。
+同步时执行检测。写操作会先同步，因此能在提交前拦截不兼容的版本。升级后首次使用时，things-mcp 会清空旧的本地缓存，下次同步时从 Things Cloud 重新拉取。
 
 ## 卸载
 

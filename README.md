@@ -88,7 +88,7 @@ Every sync compares the cloud's version markers with what this build supports:
 
 When something is newer, the sync stops, the state is stored locally, and every MCP data operation returns a **tool result** with `isError: true` and a structured `INCOMPATIBLE_VERSION` payload (`message`, `do_not_retry`, `remediation`) so the agent can read it and stop. CLI data commands exit with an error. Neither touches the replica. `sync`, `verify`, `doctor`, and `account` still run so you can re-check after upgrading things-mcp. `verify`, `doctor`, and `sync_status` show the last check.
 
-Detection happens at sync time. Writes always sync first, so they are blocked before any commit. The first sync of an older, unvalidated replica replays its history before marking it compatible.
+Detection happens at sync time. Writes always sync first, so they are blocked before any commit. On first use after an upgrade, things-mcp clears the old local cache. The next sync rebuilds it from Things Cloud.
 
 ## Uninstall
 

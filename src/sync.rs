@@ -63,7 +63,6 @@ impl SyncEngine {
     pub async fn sync(&mut self, full: bool) -> Result<SyncReport> {
         let mut check = self.store.begin_compat_check()?;
         let state = self.store.sync_state()?;
-        let full = full || self.store.needs_compat_replay(&state)?;
         let (history_key, meta, mut history_replaced) =
             resolve_history(&self.client, state.history_key.as_deref()).await?;
         if state.cursor > meta.latest_server_index {
@@ -87,6 +86,7 @@ impl SyncEngine {
             let path = directory.path().join("replica.sqlite");
             let mut staged = Store::open(&path)?;
             staged.bind_history(&report.history_key)?;
+            report.generation = staged.sync_state()?.generation;
             let result = pull_history(
                 &self.client,
                 &mut staged,
