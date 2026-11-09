@@ -84,7 +84,7 @@ Every sync compares the cloud's version markers with what this build supports:
 - entity generations may not exceed `Task7`, `Area3`, `Tag4`, `ChecklistItem3`, `Settings5`, `Tombstone2`
 - unknown entity kinds and unknown item actions are treated as incompatible
 
-When something is newer, the sync stops, the state is stored locally, and every CLI or MCP data operation returns an `INCOMPATIBLE_VERSION` warning without touching the replica. `sync`, `verify`, `doctor`, and `account` still run so you can re-check after upgrading things-mcp. `verify`, `doctor`, and `sync_status` show the last check.
+When something is newer, the sync stops, the state is stored locally, and every MCP data operation returns a **tool result** with `isError: true` and a structured `INCOMPATIBLE_VERSION` payload (`message`, `do_not_retry`, `remediation`) so the agent can read it and stop. CLI data commands exit with an error. Neither touches the replica. `sync`, `verify`, `doctor`, and `account` still run so you can re-check after upgrading things-mcp. `verify`, `doctor`, and `sync_status` show the last check.
 
 Detection happens at sync time. Writes always sync first, so they are blocked before any commit.
 

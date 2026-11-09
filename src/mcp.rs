@@ -26,10 +26,46 @@ use crate::store::{
 };
 use crate::sync::{SyncEngine, SyncReport};
 use crate::things::{
-    ClientOptions, HttpTransport, TaskDraft, ThingsClient, ThingsError, When, parse_day,
-    parse_reminder,
+    ClientOptions, HttpTransport, SUPPORTED_SCHEMA, TaskDraft, ThingsClient, ThingsError, When,
+    parse_day, parse_reminder,
 };
 use crate::write::{TaskPatch, WriteService};
+
+macro_rules! store_or_return {
+    ($server:expr) => {
+        match $server.open_store() {
+            Ok(store) => store,
+            Err(result) => return Ok(result),
+        }
+    };
+}
+
+macro_rules! store_or_err {
+    ($server:expr) => {
+        match $server.open_store() {
+            Ok(store) => store,
+            Err(result) => return Err(result),
+        }
+    };
+}
+
+macro_rules! value_or_return {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        }
+    };
+}
+
+macro_rules! write_service_or_return {
+    ($server:expr, $dry_run:expr) => {
+        match $server.write_service($dry_run).await {
+            Ok(service) => service,
+            Err(result) => return Ok(result),
+        }
+    };
+}
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
@@ -69,14 +105,51 @@ impl ThingsServer {
         Store::open(&self.state.config.db_path).map_err(internal)
     }
 
-    /// Data tools go through this gate: an incompatible cloud version blocks
-    /// every read and write until the replica is refreshed by a newer build.
-    fn open_store(&self) -> Result<Store, McpError> {
-        let store = self.open_store_raw()?;
-        store
-            .ensure_compatible()
-            .map_err(|error| incompatible_error(error))?;
+    /// Data tools go through this gate. Failures are returned as an MCP
+    /// **tool result** (`isError: true`) so the agent can read the reason and
+    /// stop, instead of a JSON-RPC protocol error it may never see.
+    fn open_store(&self) -> Result<Store, CallToolResult> {
+        let store = match self.open_store_raw() {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(tool_error(
+                    "LOCAL_DB_ERROR",
+                    error.message.to_string(),
+                    json!({}),
+                ));
+            }
+        };
+        if let Err(error) = store.ensure_compatible() {
+            return Err(self.incompatible_result(&store, &error));
+        }
         Ok(store)
+    }
+
+    fn incompatible_result(&self, store: &Store, error: &anyhow::Error) -> CallToolResult {
+        let compat = store.compat().ok();
+        let reason = compat
+            .as_ref()
+            .and_then(|compat| compat.reason.clone())
+            .unwrap_or_else(|| error.to_string());
+        tool_error(
+            "INCOMPATIBLE_VERSION",
+            format!(
+                "Things Cloud is incompatible with this build: {reason}. Do not retry; \
+                 ask the user to upgrade things-mcp, then run sync."
+            ),
+            json!({
+                "do_not_retry": true,
+                "cloud_schema": compat.as_ref().and_then(|c| c.cloud_schema),
+                "supported_schema": SUPPORTED_SCHEMA,
+                "entities": compat.as_ref().map(|c| c.entities.clone()),
+                "checked_at": compat.as_ref().and_then(|c| c.checked_at.clone()),
+                "remediation": [
+                    "Stop calling things-mcp tools.",
+                    "Ask the user to upgrade things-mcp to a build that supports this cloud schema.",
+                    "After upgrading, call sync_now once; the compatibility state clears on success."
+                ],
+            }),
+        )
     }
 
     fn build_client(&self, store: &Store) -> Result<ThingsClient, McpError> {
@@ -106,7 +179,7 @@ impl ThingsServer {
         if self.state.refresh_secs == 0 {
             return Ok(false);
         }
-        let store = self.open_store()?;
+        let store = self.open_store_raw()?;
         let Some(last) = store.last_sync_at().map_err(internal)? else {
             return Ok(true);
         };
@@ -153,15 +226,16 @@ impl ThingsServer {
         kind: &ListKind,
         limit: usize,
         offset: usize,
-    ) -> Result<Value, McpError> {
-        let store = self.open_store()?;
+    ) -> Result<Value, CallToolResult> {
+        let store = store_or_err!(self);
         let conn = store.connection();
         let today = fmt::today_epoch_day();
         let limit = clamp(limit);
 
         match kind {
             ListKind::Projects => {
-                let projects = list_projects(conn, None, Some("open"), limit).map_err(internal)?;
+                let projects =
+                    list_projects(conn, None, Some("open"), limit).map_err(query_error)?;
                 Ok(json!({
                     "list": "projects",
                     "count": projects.len(),
@@ -169,7 +243,7 @@ impl ThingsServer {
                 }))
             }
             ListKind::Areas => {
-                let areas = list_areas(conn, limit).map_err(internal)?;
+                let areas = list_areas(conn, limit).map_err(query_error)?;
                 Ok(json!({
                     "list": "areas",
                     "count": areas.len(),
@@ -177,9 +251,9 @@ impl ThingsServer {
                 }))
             }
             _ => {
-                let total = count_tasks(conn, kind, today).map_err(internal)?;
-                let tasks = list_tasks(conn, kind, today, limit, offset).map_err(internal)?;
-                let items = summaries(conn, &tasks, today).map_err(internal)?;
+                let total = count_tasks(conn, kind, today).map_err(query_error)?;
+                let tasks = list_tasks(conn, kind, today, limit, offset).map_err(query_error)?;
+                let items = summaries(conn, &tasks, today).map_err(query_error)?;
                 let seen = offset as i64 + items.len() as i64;
                 Ok(json!({
                     "list": kind.as_str(),
@@ -389,13 +463,38 @@ pub struct SyncNowArgs {
 }
 
 impl ThingsServer {
-    async fn write_service(&self, dry_run: bool) -> Result<WriteService, McpError> {
+    async fn write_service(&self, dry_run: bool) -> Result<WriteService, CallToolResult> {
+        let store = match self.open_store_raw() {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(tool_error(
+                    "LOCAL_DB_ERROR",
+                    error.message.to_string(),
+                    json!({}),
+                ));
+            }
+        };
+        if let Err(error) = store.ensure_compatible() {
+            return Err(self.incompatible_result(&store, &error));
+        }
+
         if dry_run {
             return Ok(WriteService::Preview(self.state.config.db_path.clone()));
         }
-        let store = self.open_store_raw()?;
-        let client = self.build_client(&store)?;
-        client.login().await.map_err(things_error)?;
+
+        let client = match self.build_client(&store) {
+            Ok(client) => client,
+            Err(error) => {
+                return Err(tool_error(
+                    "CONFIG_ERROR",
+                    error.message.to_string(),
+                    json!({}),
+                ));
+            }
+        };
+        if let Err(error) = client.login().await {
+            return Err(tool_error(code_of(&error), error.to_string(), json!({})));
+        }
         Ok(WriteService::live(SyncEngine::new(client, store)))
     }
 }
@@ -446,11 +545,11 @@ impl ThingsServer {
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
         let kind = parse_list(&args.list)?;
-        let payload = self.list_payload(
+        let payload = value_or_return!(self.list_payload(
             &kind,
             args.limit.unwrap_or(DEFAULT_LIMIT),
             args.offset.unwrap_or(0),
-        )?;
+        ));
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
@@ -462,7 +561,7 @@ impl ThingsServer {
         Parameters(args): Parameters<GetTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let today = fmt::today_epoch_day();
         let detail = task_detail(store.connection(), &args.id, today)
             .map_err(internal)?
@@ -484,7 +583,7 @@ impl ThingsServer {
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let today = fmt::today_epoch_day();
         let status = match args.status.as_deref() {
             None => None,
@@ -530,7 +629,7 @@ impl ThingsServer {
         Parameters(args): Parameters<ListProjectsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let limit = clamp(args.limit.unwrap_or(DEFAULT_LIMIT));
         let projects = list_projects(
             store.connection(),
@@ -549,7 +648,7 @@ impl ThingsServer {
         Parameters(args): Parameters<LimitArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let areas = list_areas(
             store.connection(),
             clamp(args.limit.unwrap_or(DEFAULT_LIMIT)),
@@ -565,7 +664,7 @@ impl ThingsServer {
         Parameters(args): Parameters<LimitArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let tags = list_tags(
             store.connection(),
             clamp(args.limit.unwrap_or(DEFAULT_LIMIT)),
@@ -581,11 +680,11 @@ impl ThingsServer {
         Parameters(args): Parameters<ListTasksArgs2>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let payload = self.list_payload(
+        let payload = value_or_return!(self.list_payload(
             &ListKind::Logbook,
             args.limit.unwrap_or(DEFAULT_LIMIT),
             args.offset.unwrap_or(0),
-        )?;
+        ));
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
@@ -595,11 +694,11 @@ impl ThingsServer {
         Parameters(args): Parameters<ListTasksArgs2>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let payload = self.list_payload(
+        let payload = value_or_return!(self.list_payload(
             &ListKind::Deadlines,
             args.limit.unwrap_or(DEFAULT_LIMIT),
             args.offset.unwrap_or(0),
-        )?;
+        ));
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
@@ -609,11 +708,11 @@ impl ThingsServer {
         Parameters(args): Parameters<ListTasksArgs2>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let payload = self.list_payload(
+        let payload = value_or_return!(self.list_payload(
             &ListKind::Upcoming,
             args.limit.unwrap_or(DEFAULT_LIMIT),
             args.offset.unwrap_or(0),
-        )?;
+        ));
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
@@ -623,11 +722,11 @@ impl ThingsServer {
         Parameters(args): Parameters<ListByIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let payload = self.list_payload(
+        let payload = value_or_return!(self.list_payload(
             &ListKind::Project(args.id),
             args.limit.unwrap_or(DEFAULT_LIMIT),
             args.offset.unwrap_or(0),
-        )?;
+        ));
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
@@ -637,11 +736,11 @@ impl ThingsServer {
         Parameters(args): Parameters<ListByIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let payload = self.list_payload(
+        let payload = value_or_return!(self.list_payload(
             &ListKind::Area(args.id),
             args.limit.unwrap_or(DEFAULT_LIMIT),
             args.offset.unwrap_or(0),
-        )?;
+        ));
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
@@ -651,11 +750,11 @@ impl ThingsServer {
         Parameters(args): Parameters<ListByIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let payload = self.list_payload(
+        let payload = value_or_return!(self.list_payload(
             &ListKind::Tag(args.id),
             args.limit.unwrap_or(DEFAULT_LIMIT),
             args.offset.unwrap_or(0),
-        )?;
+        ));
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
@@ -665,7 +764,7 @@ impl ThingsServer {
         Parameters(args): Parameters<GetByIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let today = fmt::today_epoch_day();
         let limit = clamp(args.limit.unwrap_or(DEFAULT_LIMIT));
         let detail = project_detail(store.connection(), &args.id, today, limit)
@@ -681,7 +780,7 @@ impl ThingsServer {
         Parameters(args): Parameters<GetByIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let today = fmt::today_epoch_day();
         let limit = clamp(args.limit.unwrap_or(DEFAULT_LIMIT));
         let detail = area_detail(store.connection(), &args.id, today, limit)
@@ -697,7 +796,7 @@ impl ThingsServer {
         Parameters(args): Parameters<GetByIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         let warning = self.ensure_fresh().await;
-        let store = self.open_store()?;
+        let store = store_or_return!(self);
         let today = fmt::today_epoch_day();
         let limit = clamp(args.limit.unwrap_or(DEFAULT_LIMIT));
         let detail = tag_detail(store.connection(), &args.id, today, limit)
@@ -727,7 +826,7 @@ impl ThingsServer {
             args.reminder,
             0,
         )?;
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.create_task(draft).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -752,7 +851,7 @@ impl ThingsServer {
             args.reminder,
             1,
         )?;
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.create_task(draft).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -765,7 +864,7 @@ impl ThingsServer {
         Parameters(args): Parameters<CreateAreaArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .create_area(&args.title)
             .await
@@ -781,7 +880,7 @@ impl ThingsServer {
         Parameters(args): Parameters<CreateTagArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .create_tag(
                 &args.title,
@@ -861,7 +960,7 @@ impl ThingsServer {
             reminder_time,
         };
 
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .update_task(&args.id, patch)
             .await
@@ -877,7 +976,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.complete_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -890,7 +989,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.cancel_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -903,7 +1002,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.reopen_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -916,7 +1015,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .trash_task(&args.id, false)
             .await
@@ -932,7 +1031,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .trash_task(&args.id, true)
             .await
@@ -948,7 +1047,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.delete_task(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -961,7 +1060,7 @@ impl ThingsServer {
         Parameters(args): Parameters<ChecklistArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .add_checklist_item(&args.task_id, &args.title)
             .await
@@ -990,7 +1089,7 @@ impl ThingsServer {
             args.shortcut.map(Some)
         };
 
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .update_tag(&args.id, args.title, parent, shortcut)
             .await
@@ -1008,7 +1107,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.delete_tag(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -1026,7 +1125,7 @@ impl ThingsServer {
         } else {
             args.tags
         };
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .update_area(&args.id, args.title, tags)
             .await
@@ -1044,7 +1143,7 @@ impl ThingsServer {
         Parameters(args): Parameters<IdDryRunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dry_run = args.dry_run.unwrap_or(false);
-        let mut service = self.write_service(dry_run).await?;
+        let mut service = write_service_or_return!(self, dry_run);
         let outcome = service.delete_area(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
@@ -1056,9 +1155,25 @@ impl ThingsServer {
         &self,
         Parameters(args): Parameters<SyncNowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let report = self.refresh(true, args.full).await?.ok_or_else(|| {
-            McpError::internal_error("sync did not run", Some(json!({"code": "SYNC_SKIPPED"})))
-        })?;
+        let report = match self.refresh(true, args.full).await {
+            Ok(Some(report)) => report,
+            Ok(None) => {
+                return Err(McpError::internal_error(
+                    "sync did not run",
+                    Some(json!({"code": "SYNC_SKIPPED"})),
+                ));
+            }
+            Err(error) => {
+                if error.message.to_lowercase().contains("incompatible") {
+                    return Ok(tool_error(
+                        "INCOMPATIBLE_VERSION",
+                        error.message.to_string(),
+                        json!({"do_not_retry": true}),
+                    ));
+                }
+                return Err(error);
+            }
+        };
         let store = self.open_store_raw()?;
         let payload = json!({
             "history_key": report.history_key,
@@ -1168,11 +1283,16 @@ fn not_found(kind: &str, id: &str) -> McpError {
     )
 }
 
-fn incompatible_error(error: anyhow::Error) -> McpError {
-    McpError::internal_error(
-        error.to_string(),
-        Some(json!({ "code": "INCOMPATIBLE_VERSION" })),
-    )
+fn query_error(error: impl std::fmt::Display) -> CallToolResult {
+    tool_error("QUERY_FAILED", error.to_string(), json!({}))
+}
+
+fn tool_error(code: &str, message: impl Into<String>, details: Value) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": code,
+        "message": message.into(),
+        "details": details,
+    }))
 }
 
 fn invalid_param(error: impl std::fmt::Display) -> McpError {

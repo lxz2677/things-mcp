@@ -225,3 +225,98 @@ fn stdio_server_lists_and_calls_tools() {
     assert_eq!(payload["title"], "Work");
     assert_eq!(payload["tags"], json!(["tag-1"]));
 }
+
+fn call_tool(db: &std::path::Path, name: &str, arguments: Value) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_things-mcp"))
+        .arg("serve")
+        .env("THINGS_DB", db)
+        .env("THINGS_REFRESH_SECS", "0")
+        .env("RUST_LOG", "error")
+        .env_remove("THINGS_EMAIL")
+        .env_remove("THINGS_PASSWORD")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn things-mcp serve");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for line in [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "stdio-test", "version": "0.1"}
+                }
+            }),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
+        ] {
+            writeln!(stdin, "{line}").unwrap();
+        }
+        stdin.flush().unwrap();
+    }
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut response = None;
+    while response.is_none() {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let value: Value = serde_json::from_str(line.trim()).expect("valid JSON-RPC");
+        if value["id"] == 2 {
+            response = Some(value);
+        }
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+
+    response.expect("tools/call response")["result"].clone()
+}
+
+#[test]
+fn incompatible_replica_returns_a_readable_tool_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("things.sqlite");
+    seed(&db);
+
+    {
+        let store = Store::open(&db).unwrap();
+        store
+            .set_compat_incompatible(
+                "cloud schema 302 (supported 301)",
+                Some(302),
+                &Default::default(),
+            )
+            .unwrap();
+    }
+
+    let result = call_tool(&db, "list_tasks", json!({"list": "inbox"}));
+
+    assert_eq!(
+        result["isError"], true,
+        "must be a tool result, not a JSON-RPC error"
+    );
+    let payload = &result["structuredContent"];
+    assert_eq!(payload["error"], "INCOMPATIBLE_VERSION");
+    assert_eq!(payload["details"]["do_not_retry"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("upgrade"),
+        "the text content must tell the agent what to do"
+    );
+}

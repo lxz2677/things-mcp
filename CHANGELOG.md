@@ -7,6 +7,7 @@ Add each release under a `## vX.Y.Z` heading. The release workflow uses that sec
 - Detect incompatible Things Cloud versions at sync time: `schema` must be 301, entity generations are capped at Task7/Area3/Tag4/ChecklistItem3/Settings5/Tombstone2, and unknown entity kinds or item actions fail the sync.
 - The compatibility state is persisted. Every CLI/MCP data operation then returns an `INCOMPATIBLE_VERSION` warning and stops without touching the replica; `sync`, `verify`, `doctor`, and `account` remain available to re-check after upgrading.
 - `verify`, `doctor`, and `sync_status` show the compatibility state and the last check time; `doctor` adds a `compat.status` audit check.
+- Incompatibility is returned to MCP clients as a tool result (`isError: true`) with a structured `INCOMPATIBLE_VERSION` payload and remediation text, so agents can read the reason and stop instead of relying on a JSON-RPC error.
 
 ## v0.2.1
 

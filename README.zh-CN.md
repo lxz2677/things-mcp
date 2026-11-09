@@ -84,7 +84,7 @@
 - 实体代际不超过 `Task7`、`Area3`、`Tag4`、`ChecklistItem3`、`Settings5`、`Tombstone2`
 - 未知实体类型、未知动作 `t` 一律视为不兼容
 
-一旦发现更新：sync 立即停止并把状态写入本地；之后 CLI 和 MCP 的所有数据操作都会返回 `INCOMPATIBLE_VERSION` 警告并终止，不读也不写副本。`sync`、`verify`、`doctor`、`account` 仍可运行，方便升级后重新检测。`verify`、`doctor`、`sync_status` 会显示上次检测结果。
+一旦发现更新：sync 立即停止并把状态写入本地；之后 MCP 的所有数据操作会返回 **工具结果**（`isError: true`）并带上结构化的 `INCOMPATIBLE_VERSION`（含 `message`、`do_not_retry`、`remediation`），Agent 可以直接读到并停止；CLI 数据命令以错误退出。两者都不会读写副本。`sync`、`verify`、`doctor`、`account` 仍可运行，方便升级后重新检测。`verify`、`doctor`、`sync_status` 会显示上次检测结果。
 
 检测发生在 sync 时；写操作本来就会先 sync，所以会在 commit 前被拦住。
 
