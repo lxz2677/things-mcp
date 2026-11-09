@@ -156,7 +156,7 @@ fn stdio_server_lists_and_calls_tools() {
         .find(|value| value["id"] == 2)
         .expect("tools/list response");
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 36, "tool count");
+    assert_eq!(tools.len(), 46, "tool count");
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -198,6 +198,16 @@ fn stdio_server_lists_and_calls_tools() {
         "update_checklist_item",
         "toggle_checklist_item",
         "delete_checklist_item",
+        "create_heading",
+        "update_heading",
+        "delete_heading",
+        "update_project",
+        "complete_project",
+        "cancel_project",
+        "reopen_project",
+        "trash_project",
+        "restore_project",
+        "delete_project",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }

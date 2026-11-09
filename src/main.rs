@@ -353,6 +353,100 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Create a heading (section) inside a project.
+    CreateHeading {
+        #[arg(long)]
+        project: String,
+        title: String,
+        #[arg(long)]
+        index: Option<i64>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Rename a heading or change its position.
+    UpdateHeading {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        index: Option<i64>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete an empty heading.
+    DeleteHeading {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Update a project (title, notes, dates, area, tags, repeat).
+    UpdateProject {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        when: Option<String>,
+        #[arg(long)]
+        deadline: Option<String>,
+        #[arg(long)]
+        clear_deadline: bool,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long)]
+        clear_area: bool,
+        #[arg(long = "tag")]
+        tag: Vec<String>,
+        #[arg(long)]
+        clear_tags: bool,
+        #[arg(long)]
+        repeat: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeat_interval: u32,
+        #[arg(long)]
+        repeat_end: Option<String>,
+        #[arg(long)]
+        clear_repeat: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Mark a project completed.
+    CompleteProject {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Mark a project canceled.
+    CancelProject {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Reopen a completed or canceled project.
+    ReopenProject {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move a project to the trash.
+    TrashProject {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restore a project from the trash.
+    RestoreProject {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Permanently delete an empty project.
+    DeleteProject {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run the MCP server over stdio.
     Serve {
         /// Seconds before a read tool triggers a background pull (0 = never).
@@ -620,6 +714,77 @@ async fn main() -> Result<()> {
         }
         Command::DeleteChecklist { id, dry_run } => {
             write_delete_checklist(&config, &id, dry_run).await
+        }
+        Command::CreateHeading {
+            project,
+            title,
+            index,
+            dry_run,
+        } => write_create_heading(&config, &project, &title, index, dry_run).await,
+        Command::UpdateHeading {
+            id,
+            title,
+            index,
+            dry_run,
+        } => write_update_heading(&config, &id, title, index, dry_run).await,
+        Command::DeleteHeading { id, dry_run } => write_delete_heading(&config, &id, dry_run).await,
+        Command::UpdateProject {
+            id,
+            title,
+            notes,
+            when,
+            deadline,
+            clear_deadline,
+            area,
+            clear_area,
+            tag,
+            clear_tags,
+            repeat,
+            repeat_interval,
+            repeat_end,
+            clear_repeat,
+            dry_run,
+        } => {
+            let repeat = if clear_repeat || repeat.as_deref() == Some("none") {
+                Some(None)
+            } else {
+                parse_repeat_cli(repeat.as_deref(), repeat_interval, repeat_end.as_deref())?
+                    .map(Some)
+            };
+            write_update_project(
+                &config,
+                &id,
+                title,
+                notes,
+                when,
+                deadline,
+                clear_deadline,
+                area,
+                clear_area,
+                tag,
+                clear_tags,
+                repeat,
+                dry_run,
+            )
+            .await
+        }
+        Command::CompleteProject { id, dry_run } => {
+            write_project_status(&config, &id, ProjectAction::Complete, dry_run).await
+        }
+        Command::CancelProject { id, dry_run } => {
+            write_project_status(&config, &id, ProjectAction::Cancel, dry_run).await
+        }
+        Command::ReopenProject { id, dry_run } => {
+            write_project_status(&config, &id, ProjectAction::Reopen, dry_run).await
+        }
+        Command::TrashProject { id, dry_run } => {
+            write_project_status(&config, &id, ProjectAction::Trash, dry_run).await
+        }
+        Command::RestoreProject { id, dry_run } => {
+            write_project_status(&config, &id, ProjectAction::Restore, dry_run).await
+        }
+        Command::DeleteProject { id, dry_run } => {
+            write_project_status(&config, &id, ProjectAction::Delete, dry_run).await
         }
         Command::Serve { refresh_secs, .. } => things_mcp::mcp::run(config, refresh_secs).await,
     }
@@ -941,6 +1106,117 @@ async fn write_toggle_checklist(
 async fn write_delete_checklist(config: &Config, id: &str, dry_run: bool) -> Result<()> {
     let mut service = write_service(config, dry_run).await?;
     print_json(&service.delete_checklist_item(id).await?)
+}
+
+async fn write_create_heading(
+    config: &Config,
+    project: &str,
+    title: &str,
+    index: Option<i64>,
+    dry_run: bool,
+) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(
+        &service
+            .create_heading(project, title, index.unwrap_or(0))
+            .await?,
+    )
+}
+
+async fn write_update_heading(
+    config: &Config,
+    id: &str,
+    title: Option<String>,
+    index: Option<i64>,
+    dry_run: bool,
+) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.update_heading(id, title, index).await?)
+}
+
+async fn write_delete_heading(config: &Config, id: &str, dry_run: bool) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.delete_heading(id).await?)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_update_project(
+    config: &Config,
+    id: &str,
+    title: Option<String>,
+    notes: Option<String>,
+    when: Option<String>,
+    deadline: Option<String>,
+    clear_deadline: bool,
+    area: Option<String>,
+    clear_area: bool,
+    tags: Vec<String>,
+    clear_tags: bool,
+    repeat: Option<Option<RepeatSpec>>,
+    dry_run: bool,
+) -> Result<()> {
+    let deadline = if clear_deadline {
+        Some(None)
+    } else {
+        deadline
+            .as_deref()
+            .map(things_mcp::things::parse_day)
+            .transpose()?
+            .map(Some)
+    };
+    let area = if clear_area {
+        Some(None)
+    } else {
+        area.map(Some)
+    };
+    let tags = if clear_tags {
+        Some(Vec::new())
+    } else if tags.is_empty() {
+        None
+    } else {
+        Some(tags)
+    };
+    let patch = TaskPatch {
+        title,
+        notes,
+        when: when.as_deref().map(When::parse).transpose()?,
+        deadline,
+        project: None,
+        area,
+        heading: None,
+        tags,
+        reminder_time: None,
+        repeat,
+    };
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.update_project(id, patch).await?)
+}
+
+enum ProjectAction {
+    Complete,
+    Cancel,
+    Reopen,
+    Trash,
+    Restore,
+    Delete,
+}
+
+async fn write_project_status(
+    config: &Config,
+    id: &str,
+    action: ProjectAction,
+    dry_run: bool,
+) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    let outcome = match action {
+        ProjectAction::Complete => service.complete_project(id).await?,
+        ProjectAction::Cancel => service.cancel_project(id).await?,
+        ProjectAction::Reopen => service.reopen_project(id).await?,
+        ProjectAction::Trash => service.trash_project(id, false).await?,
+        ProjectAction::Restore => service.trash_project(id, true).await?,
+        ProjectAction::Delete => service.delete_project(id).await?,
+    };
+    print_json(&outcome)
 }
 
 fn parse_repeat_cli(

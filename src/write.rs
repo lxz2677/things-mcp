@@ -14,7 +14,7 @@ use crate::sync::SyncEngine;
 use crate::things::encode::{self, RepeatSpec, TaskDraft, When};
 use crate::things::{
     ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem, TYPE_HEADING, TYPE_PROJECT,
-    ThingsError,
+    TYPE_TODO, ThingsError,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -91,6 +91,20 @@ impl WriteService {
         .await
     }
 
+    pub async fn create_heading(
+        &mut self,
+        project_id: &str,
+        title: &str,
+        index: i64,
+    ) -> Result<WriteOutcome> {
+        let mut draft = TaskDraft::new(title);
+        draft.task_type = TYPE_HEADING;
+        draft.when = When::Anytime;
+        draft.project = Some(project_id.to_owned());
+        draft.index = index;
+        self.create_task(draft).await
+    }
+
     pub async fn create_area(&mut self, title: &str) -> Result<WriteOutcome> {
         self.execute(
             &ids::new_id(),
@@ -138,7 +152,7 @@ impl WriteService {
             encode::CHECKLIST_KIND,
             "created",
             |replica| {
-                expect_task(replica, task_id)?;
+                expect_entity(replica, task_id, TYPE_TODO)?;
                 let payload =
                     encode::checklist_create_payload(task_id, title, 0, fmt::now_seconds());
                 encode::validate_checklist_create(&payload)?;
@@ -221,11 +235,29 @@ impl WriteService {
     }
 
     pub async fn update_task(&mut self, id: &str, patch: TaskPatch) -> Result<WriteOutcome> {
+        self.update_entity(id, patch, TYPE_TODO).await
+    }
+
+    pub async fn update_project(&mut self, id: &str, patch: TaskPatch) -> Result<WriteOutcome> {
+        self.update_entity(id, patch, TYPE_PROJECT).await
+    }
+
+    async fn update_entity(
+        &mut self,
+        id: &str,
+        patch: TaskPatch,
+        expected: i64,
+    ) -> Result<WriteOutcome> {
         if patch.is_empty() {
             bail!("nothing to update: provide at least one field");
         }
+        if expected == TYPE_PROJECT
+            && (patch.project.is_some() || patch.heading.is_some() || patch.reminder_time.is_some())
+        {
+            bail!("projects cannot have a parent project, a heading, or a reminder");
+        }
         self.execute(id, ACTION_UPDATE, encode::TASK_KIND, "updated", |replica| {
-            let existing = expect_task(replica, id)?;
+            let existing = expect_entity(replica, id, expected)?;
             validate_container(
                 replica,
                 patch.project.as_ref().and_then(|id| id.as_deref()),
@@ -321,38 +353,129 @@ impl WriteService {
         .await
     }
 
+    pub async fn update_heading(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        index: Option<i64>,
+    ) -> Result<WriteOutcome> {
+        self.execute(id, ACTION_UPDATE, encode::TASK_KIND, "updated", |replica| {
+            let existing = expect_entity(replica, id, TYPE_HEADING)?;
+            let mut delta = Map::new();
+            if let Some(title) = &title
+                && *title != existing.title
+            {
+                delta.insert("tt".into(), json!(title));
+            }
+            if let Some(index) = index
+                && Some(index) != existing.index
+            {
+                delta.insert("ix".into(), json!(index));
+            }
+            if delta.is_empty() {
+                bail!("nothing changed");
+            }
+            delta.insert("md".into(), json!(fmt::now_seconds()));
+            Ok(Value::Object(delta))
+        })
+        .await
+    }
+
     pub async fn complete_task(&mut self, id: &str) -> Result<WriteOutcome> {
-        self.change_task(id, ACTION_UPDATE, "completed", || {
+        self.change_entity(id, ACTION_UPDATE, "completed", TYPE_TODO, || {
+            encode::complete_update(fmt::now_seconds())
+        })
+        .await
+    }
+
+    pub async fn complete_project(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.change_entity(id, ACTION_UPDATE, "completed", TYPE_PROJECT, || {
             encode::complete_update(fmt::now_seconds())
         })
         .await
     }
 
     pub async fn cancel_task(&mut self, id: &str) -> Result<WriteOutcome> {
-        self.change_task(id, ACTION_UPDATE, "canceled", || {
+        self.change_entity(id, ACTION_UPDATE, "canceled", TYPE_TODO, || {
+            encode::cancel_update(fmt::now_seconds())
+        })
+        .await
+    }
+
+    pub async fn cancel_project(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.change_entity(id, ACTION_UPDATE, "canceled", TYPE_PROJECT, || {
             encode::cancel_update(fmt::now_seconds())
         })
         .await
     }
 
     pub async fn reopen_task(&mut self, id: &str) -> Result<WriteOutcome> {
-        self.change_task(id, ACTION_UPDATE, "reopened", || {
+        self.change_entity(id, ACTION_UPDATE, "reopened", TYPE_TODO, || {
+            encode::reopen_update(fmt::now_seconds())
+        })
+        .await
+    }
+
+    pub async fn reopen_project(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.change_entity(id, ACTION_UPDATE, "reopened", TYPE_PROJECT, || {
             encode::reopen_update(fmt::now_seconds())
         })
         .await
     }
 
     pub async fn trash_task(&mut self, id: &str, restore: bool) -> Result<WriteOutcome> {
+        self.trash_entity(id, restore, TYPE_TODO).await
+    }
+
+    pub async fn trash_project(&mut self, id: &str, restore: bool) -> Result<WriteOutcome> {
+        self.trash_entity(id, restore, TYPE_PROJECT).await
+    }
+
+    async fn trash_entity(
+        &mut self,
+        id: &str,
+        restore: bool,
+        expected: i64,
+    ) -> Result<WriteOutcome> {
         let status = if restore { "restored" } else { "trashed" };
-        self.change_task(id, ACTION_UPDATE, status, || {
+        self.change_entity(id, ACTION_UPDATE, status, expected, || {
             encode::trash_update(!restore, fmt::now_seconds())
         })
         .await
     }
 
     pub async fn delete_task(&mut self, id: &str) -> Result<WriteOutcome> {
-        self.change_task(id, ACTION_DELETE, "deleted", || json!({}))
-            .await
+        self.delete_entity(id, TYPE_TODO).await
+    }
+
+    pub async fn delete_project(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.delete_entity(id, TYPE_PROJECT).await
+    }
+
+    pub async fn delete_heading(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.delete_entity(id, TYPE_HEADING).await
+    }
+
+    async fn delete_entity(&mut self, id: &str, expected: i64) -> Result<WriteOutcome> {
+        self.execute(id, ACTION_DELETE, encode::TASK_KIND, "deleted", |replica| {
+            expect_entity(replica, id, expected)?;
+            if expected == TYPE_PROJECT
+                && let Some(child) = replica.query(|store| store.first_task_in_project(id))?
+            {
+                bail!(
+                    "cannot delete project {id} while it contains {child}; move or delete its tasks first"
+                );
+            }
+            if expected == TYPE_HEADING
+                && let Some(child) = replica.query(|store| store.first_task_in_heading(id))?
+            {
+                bail!(
+                    "cannot delete heading {id} while it contains {child}; move its tasks first"
+                );
+            }
+            Ok(json!({}))
+        })
+        .await
     }
 
     pub async fn update_tag(
@@ -449,15 +572,16 @@ impl WriteService {
         .await
     }
 
-    async fn change_task(
+    async fn change_entity(
         &mut self,
         id: &str,
         action: i64,
         status: &str,
+        expected: i64,
         prepare: impl Fn() -> Value,
     ) -> Result<WriteOutcome> {
         self.execute(id, action, encode::TASK_KIND, status, |replica| {
-            expect_task(replica, id)?;
+            expect_entity(replica, id, expected)?;
             Ok(prepare())
         })
         .await
@@ -619,10 +743,29 @@ fn expect_area(replica: &Replica<'_>, id: &str) -> Result<crate::things::Area> {
         .ok_or_else(|| anyhow!("area {id} not found locally; run `things-mcp sync` first"))
 }
 
-fn expect_task(replica: &Replica<'_>, id: &str) -> Result<crate::things::Task> {
-    replica
-        .query(|store| store.get_task(id))?
-        .ok_or_else(|| anyhow!("task {id} not found locally; run `things-mcp sync` first"))
+fn type_label(kind: i64) -> &'static str {
+    match kind {
+        TYPE_PROJECT => "project",
+        TYPE_HEADING => "heading",
+        _ => "task",
+    }
+}
+
+fn expect_entity(replica: &Replica<'_>, id: &str, expected: i64) -> Result<crate::things::Task> {
+    let task = replica.query(|store| store.get_task(id))?.ok_or_else(|| {
+        anyhow!(
+            "{} {id} not found locally; run `things-mcp sync` first",
+            type_label(expected)
+        )
+    })?;
+    if task.type_ != expected {
+        bail!(
+            "{id} is a {}, not a {}; use the matching tool",
+            type_label(task.type_),
+            type_label(expected)
+        );
+    }
+    Ok(task)
 }
 
 #[cfg(test)]
@@ -702,6 +845,32 @@ mod tests {
             action: ACTION_CREATE,
             kind: encode::TASK_KIND.into(),
             props: json!({"tt": title, "st": 0, "ss": 0, "tp": 0, "tg": tags})
+                .as_object()
+                .unwrap()
+                .clone(),
+            server_index: 0,
+        }
+    }
+
+    fn project_item(uuid: &str, title: &str) -> IncomingItem {
+        IncomingItem {
+            uuid: uuid.into(),
+            action: ACTION_CREATE,
+            kind: encode::TASK_KIND.into(),
+            props: json!({"tt": title, "tp": 1, "st": 1, "ss": 0})
+                .as_object()
+                .unwrap()
+                .clone(),
+            server_index: 0,
+        }
+    }
+
+    fn heading_item(uuid: &str, project: &str, title: &str) -> IncomingItem {
+        IncomingItem {
+            uuid: uuid.into(),
+            action: ACTION_CREATE,
+            kind: encode::TASK_KIND.into(),
+            props: json!({"tt": title, "tp": 2, "st": 1, "ss": 0, "pr": [project]})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -1339,6 +1508,205 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not found"), "{error}");
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|request| !request.url.contains("/commit"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_heading_sends_a_heading_snapshot() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![project_item("project-1", "Work")],
+        ));
+
+        let outcome = service
+            .create_heading("project-1", "Phase 1", 3)
+            .await
+            .unwrap();
+
+        let payload = last_commit_payload(&fake, &outcome.id);
+        assert_eq!(payload["tp"], 2);
+        assert_eq!(payload["st"], 1);
+        assert_eq!(payload["pr"], json!(["project-1"]));
+        assert_eq!(payload["ix"], 3);
+        assert_eq!(payload["tt"], "Phase 1");
+        assert_eq!(payload.as_object().unwrap().len(), 34);
+
+        let task = live_store(&service).get_task(&outcome.id).unwrap().unwrap();
+        assert_eq!(task.type_, TYPE_HEADING);
+        assert_eq!(task.project.as_deref(), Some("project-1"));
+    }
+
+    #[tokio::test]
+    async fn update_heading_renames_and_reorders() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                project_item("project-1", "Work"),
+                heading_item("heading-1", "project-1", "Phase 1"),
+            ],
+        ));
+
+        service
+            .update_heading("heading-1", Some("Phase 2".into()), Some(1))
+            .await
+            .unwrap();
+
+        let payload = last_commit_payload(&fake, "heading-1");
+        assert_eq!(payload["tt"], "Phase 2");
+        assert_eq!(payload["ix"], 1);
+        assert!(payload["md"].is_number());
+        assert_eq!(payload.as_object().unwrap().len(), 3);
+
+        let error = service
+            .update_heading("project-1", Some("nope".into()), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a heading"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn delete_heading_requires_an_empty_heading() {
+        let fake = fake_ok(1);
+        let mut task = task_item("task-1", "t", vec![]);
+        task.props.insert("agr".into(), json!(["heading-1"]));
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                project_item("project-1", "Work"),
+                heading_item("heading-1", "project-1", "Phase 1"),
+                task,
+            ],
+        ));
+
+        let error = service.delete_heading("heading-1").await.unwrap_err();
+        assert!(error.to_string().contains("contains task-1"), "{error}");
+
+        service
+            .update_task(
+                "task-1",
+                TaskPatch {
+                    heading: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        service.delete_heading("heading-1").await.unwrap();
+        let entry = last_commit_entry(&fake, "heading-1");
+        assert_eq!(entry["t"], 2);
+        assert_eq!(entry["p"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn projects_have_explicit_operations() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![project_item("project-1", "Work")],
+        ));
+
+        service
+            .update_project(
+                "project-1",
+                TaskPatch {
+                    title: Some("Renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let payload = last_commit_payload(&fake, "project-1");
+        assert_eq!(payload["tt"], "Renamed");
+        assert_eq!(payload.as_object().unwrap().len(), 2);
+
+        service.complete_project("project-1").await.unwrap();
+        assert_eq!(last_commit_payload(&fake, "project-1")["ss"], 3);
+
+        service.reopen_project("project-1").await.unwrap();
+        assert_eq!(last_commit_payload(&fake, "project-1")["ss"], 0);
+
+        service.trash_project("project-1", false).await.unwrap();
+        assert_eq!(last_commit_payload(&fake, "project-1")["tr"], true);
+
+        service.trash_project("project-1", true).await.unwrap();
+        assert_eq!(last_commit_payload(&fake, "project-1")["tr"], false);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_project_requires_an_empty_project() {
+        let fake = fake_ok(1);
+        let mut task = task_item("task-1", "t", vec![]);
+        task.props.insert("pr".into(), json!(["project-1"]));
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![project_item("project-1", "Work"), task],
+        ));
+
+        let error = service.delete_project("project-1").await.unwrap_err();
+        assert!(error.to_string().contains("contains task-1"), "{error}");
+
+        service
+            .update_task(
+                "task-1",
+                TaskPatch {
+                    project: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        service.delete_project("project-1").await.unwrap();
+        assert_eq!(last_commit_entry(&fake, "project-1")["t"], 2);
+    }
+
+    #[tokio::test]
+    async fn task_tools_reject_projects_and_headings() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                project_item("project-1", "Work"),
+                heading_item("heading-1", "project-1", "Phase 1"),
+            ],
+        ));
+
+        let error = service.complete_task("project-1").await.unwrap_err();
+        assert!(
+            error.to_string().contains("is a project, not a task"),
+            "{error}"
+        );
+
+        let error = service
+            .update_task(
+                "heading-1",
+                TaskPatch {
+                    title: Some("nope".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("is a heading, not a task"),
+            "{error}"
+        );
+
+        let error = service
+            .add_checklist_item("project-1", "nope")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("is a project, not a task"),
+            "{error}"
+        );
+
         assert!(
             fake.requests()
                 .iter()

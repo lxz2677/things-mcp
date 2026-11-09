@@ -385,6 +385,45 @@ pub struct CreateProjectArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateHeadingArgs {
+    /// Project id (base58) that will own the heading.
+    pub project_id: String,
+    pub title: String,
+    /// Position within the project.
+    pub index: Option<i64>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateHeadingArgs {
+    /// Heading id (base58).
+    pub id: String,
+    pub title: Option<String>,
+    /// New position within the project.
+    pub index: Option<i64>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateProjectArgs {
+    /// Project id (base58).
+    pub id: String,
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    /// inbox | today | anytime | someday | evening | YYYY-MM-DD.
+    pub when: Option<String>,
+    pub deadline: Option<String>,
+    pub clear_deadline: Option<bool>,
+    pub area_id: Option<String>,
+    pub clear_area: Option<bool>,
+    pub tags: Option<Vec<String>>,
+    pub clear_tags: Option<bool>,
+    pub repeat: Option<RepeatSpec>,
+    pub clear_repeat: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateAreaArgs {
     pub title: String,
     pub dry_run: Option<bool>,
@@ -1306,6 +1345,213 @@ impl ThingsServer {
             "counts": counts,
         });
         Ok(CallToolResult::structured(payload))
+    }
+
+    #[tool(description = "Create a heading (section) inside a project.")]
+    async fn create_heading(
+        &self,
+        Parameters(args): Parameters<CreateHeadingArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .create_heading(&args.project_id, &args.title, args.index.unwrap_or(0))
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Rename a heading or change its position in the project.")]
+    async fn update_heading(
+        &self,
+        Parameters(args): Parameters<UpdateHeadingArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .update_heading(&args.id, args.title, args.index)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(
+        description = "Delete an empty heading. Move its tasks out first (the call is rejected otherwise)."
+    )]
+    async fn delete_heading(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .delete_heading(&args.id)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Update a project (title, notes, dates, area, tags, repeat).")]
+    async fn update_project(
+        &self,
+        Parameters(args): Parameters<UpdateProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let deadline = if args.clear_deadline.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.deadline
+                .as_deref()
+                .map(parse_day)
+                .transpose()
+                .map_err(invalid_param)?
+                .map(Some)
+        };
+        let area = if args.clear_area.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.area_id.map(Some)
+        };
+        let tags = if args.clear_tags.unwrap_or(false) {
+            Some(Vec::new())
+        } else {
+            args.tags
+        };
+        let repeat = if args.clear_repeat.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.repeat.map(Some)
+        };
+        let patch = TaskPatch {
+            title: args.title,
+            notes: args.notes,
+            when: args
+                .when
+                .as_deref()
+                .map(When::parse)
+                .transpose()
+                .map_err(invalid_param)?,
+            deadline,
+            project: None,
+            area,
+            heading: None,
+            tags,
+            reminder_time: None,
+            repeat,
+        };
+
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .update_project(&args.id, patch)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Mark a project completed.")]
+    async fn complete_project(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .complete_project(&args.id)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Mark a project canceled.")]
+    async fn cancel_project(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .cancel_project(&args.id)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Reopen a completed or canceled project.")]
+    async fn reopen_project(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .reopen_project(&args.id)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Move a project to the trash.")]
+    async fn trash_project(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .trash_project(&args.id, false)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Restore a project from the trash.")]
+    async fn restore_project(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .trash_project(&args.id, true)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(
+        description = "Permanently delete an empty project. Move or delete its tasks first (the call is rejected otherwise)."
+    )]
+    async fn delete_project(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .delete_project(&args.id)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
     }
 }
 

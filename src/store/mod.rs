@@ -521,6 +521,28 @@ impl Store {
     pub fn checklist_item(&self, id: &str) -> Result<Option<ChecklistItem>> {
         get_checklist_item(&self.conn, id)
     }
+
+    pub fn first_task_in_project(&self, project_id: &str) -> Result<Option<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id FROM task WHERE project = ?1 LIMIT 1")?;
+        let mut rows = statement.query([project_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn first_task_in_heading(&self, heading_id: &str) -> Result<Option<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id FROM task WHERE heading = ?1 LIMIT 1")?;
+        let mut rows = statement.query([heading_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 const CURSOR_KEY: &str = "processed_remote_index";

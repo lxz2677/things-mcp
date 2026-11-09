@@ -17,6 +17,12 @@ Add each release under a `## vX.Y.Z` heading. The release workflow uses that sec
 
 - Manage checklist items end to end: rename/reorder, complete/reopen (toggle), and delete. New MCP tools `update_checklist_item`, `toggle_checklist_item`, `delete_checklist_item`; new CLI commands `update-checklist`, `toggle-checklist`, `delete-checklist`.
 
+## Unreleased
+
+- Explicit project and heading semantics: `create_heading`, `update_heading`, `delete_heading`; `update_project`, `complete_project`, `cancel_project`, `reopen_project`, `trash_project`, `restore_project`, `delete_project`. Empty-only guards protect project/heading deletion.
+- Task tools now reject project and heading ids with a clear message instead of silently writing to them; checklist items can only be added to to-dos.
+- Matching CLI commands: `create-heading`, `update-heading`, `delete-heading`, `update-project`, and the project status/delete commands.
+
 ## v0.2.1
 
 - Set a local reminder time (`HH:MM`) when creating or updating a task or project with a start date. Use `--remind` in the CLI or `reminder` in MCP. For example, create a task with `--when tomorrow --remind 09:00`.
