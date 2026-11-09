@@ -178,10 +178,7 @@ impl WriteService {
                 delta.insert("tir".into(), json!(tir.map(fmt::day_to_wire)));
                 delta.insert("sb".into(), json!(sb));
                 has_reminder_date = sr.is_some();
-                if !has_reminder_date
-                    && (existing.reminder_time.is_some()
-                        || existing.raw.get("rmd").is_some_and(|value| !value.is_null()))
-                {
+                if !has_reminder_date && existing.reminder_time.is_some() {
                     reminder_time.get_or_insert(None);
                 }
             } else {
@@ -201,8 +198,6 @@ impl WriteService {
                         has_reminder_date,
                         "a reminder requires a start date; set when to today, tomorrow, evening, or YYYY-MM-DD"
                     );
-                } else if existing.raw.get("rmd").is_some_and(|value| !value.is_null()) {
-                    delta.insert("rmd".into(), Value::Null);
                 }
                 delta.insert("ato".into(), json!(reminder));
             }
@@ -944,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_reminder_sends_null() {
+    async fn clearing_a_reminder_preserves_repeater_metadata() {
         let fake = fake_ok(1);
         let mut task = task_item("task-1", "t", vec![]);
         task.props.insert("ato".into(), json!(32_400));
@@ -959,15 +954,10 @@ mod tests {
 
         let payload = last_commit_payload(&fake, "task-1");
         assert_eq!(payload.get("ato"), Some(&Value::Null));
-        assert_eq!(payload.get("rmd"), Some(&Value::Null));
-        assert_eq!(
-            live_store(&service)
-                .get_task("task-1")
-                .unwrap()
-                .unwrap()
-                .reminder_time,
-            None
-        );
+        assert!(payload.get("rmd").is_none());
+        let task = live_store(&service).get_task("task-1").unwrap().unwrap();
+        assert_eq!(task.reminder_time, None);
+        assert_eq!(task.raw["rmd"], 1_800_090_000);
     }
 
     #[tokio::test]
