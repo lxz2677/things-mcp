@@ -327,6 +327,32 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rename a checklist item or change its position.
+    UpdateChecklist {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        index: Option<i64>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Complete or reopen a checklist item (default: flip).
+    ToggleChecklist {
+        id: String,
+        #[arg(long, conflicts_with = "reopen")]
+        completed: bool,
+        #[arg(long)]
+        reopen: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete a checklist item.
+    DeleteChecklist {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run the MCP server over stdio.
     Serve {
         /// Seconds before a read tool triggers a background pull (0 = never).
@@ -571,6 +597,30 @@ async fn main() -> Result<()> {
             title,
             dry_run,
         } => write_checklist(&config, &task, &title, dry_run).await,
+        Command::UpdateChecklist {
+            id,
+            title,
+            index,
+            dry_run,
+        } => write_update_checklist(&config, &id, title, index, dry_run).await,
+        Command::ToggleChecklist {
+            id,
+            completed,
+            reopen,
+            dry_run,
+        } => {
+            let completed = if completed {
+                Some(true)
+            } else if reopen {
+                Some(false)
+            } else {
+                None
+            };
+            write_toggle_checklist(&config, &id, completed, dry_run).await
+        }
+        Command::DeleteChecklist { id, dry_run } => {
+            write_delete_checklist(&config, &id, dry_run).await
+        }
         Command::Serve { refresh_secs, .. } => things_mcp::mcp::run(config, refresh_secs).await,
     }
 }
@@ -865,6 +915,32 @@ async fn write_status(
 async fn write_checklist(config: &Config, task: &str, title: &str, dry_run: bool) -> Result<()> {
     let mut service = write_service(config, dry_run).await?;
     print_json(&service.add_checklist_item(task, title).await?)
+}
+
+async fn write_update_checklist(
+    config: &Config,
+    id: &str,
+    title: Option<String>,
+    index: Option<i64>,
+    dry_run: bool,
+) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.update_checklist_item(id, title, index).await?)
+}
+
+async fn write_toggle_checklist(
+    config: &Config,
+    id: &str,
+    completed: Option<bool>,
+    dry_run: bool,
+) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.toggle_checklist_item(id, completed).await?)
+}
+
+async fn write_delete_checklist(config: &Config, id: &str, dry_run: bool) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.delete_checklist_item(id).await?)
 }
 
 fn parse_repeat_cli(

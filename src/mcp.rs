@@ -450,6 +450,26 @@ pub struct UpdateTaskArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateChecklistArgs {
+    /// Checklist item id (base58).
+    pub id: String,
+    /// New title: omitted leaves it unchanged.
+    pub title: Option<String>,
+    /// New position within the parent's checklist (`ix`).
+    pub index: Option<i64>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ToggleChecklistArgs {
+    /// Checklist item id (base58).
+    pub id: String,
+    /// true = completed, false = reopen; omit to flip the current state.
+    pub completed: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct IdDryRunArgs {
     /// Entity id (base58).
     pub id: String,
@@ -1086,6 +1106,56 @@ impl ThingsServer {
         let mut service = write_service_or_return!(self, dry_run);
         let outcome = service
             .add_checklist_item(&args.task_id, &args.title)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Rename a checklist item or move it to a new position (`ix`).")]
+    async fn update_checklist_item(
+        &self,
+        Parameters(args): Parameters<UpdateChecklistArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .update_checklist_item(&args.id, args.title, args.index)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(
+        description = "Complete or reopen a checklist item. Omit `completed` to flip its current state."
+    )]
+    async fn toggle_checklist_item(
+        &self,
+        Parameters(args): Parameters<ToggleChecklistArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .toggle_checklist_item(&args.id, args.completed)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Delete a checklist item.")]
+    async fn delete_checklist_item(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = write_service_or_return!(self, dry_run);
+        let outcome = service
+            .delete_checklist_item(&args.id)
             .await
             .map_err(write_error)?;
         Ok(CallToolResult::structured(

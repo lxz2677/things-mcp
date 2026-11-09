@@ -148,6 +148,78 @@ impl WriteService {
         .await
     }
 
+    pub async fn update_checklist_item(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        index: Option<i64>,
+    ) -> Result<WriteOutcome> {
+        self.execute(
+            id,
+            ACTION_UPDATE,
+            encode::CHECKLIST_KIND,
+            "updated",
+            |replica| {
+                let existing = expect_checklist_item(replica, id)?;
+                let mut delta = Map::new();
+                if let Some(title) = &title
+                    && *title != existing.title
+                {
+                    delta.insert("tt".into(), json!(title));
+                }
+                if let Some(index) = index
+                    && Some(index) != existing.index
+                {
+                    delta.insert("ix".into(), json!(index));
+                }
+                if delta.is_empty() {
+                    bail!("nothing changed");
+                }
+                delta.insert("md".into(), json!(fmt::now_seconds()));
+                Ok(Value::Object(delta))
+            },
+        )
+        .await
+    }
+
+    pub async fn toggle_checklist_item(
+        &mut self,
+        id: &str,
+        completed: Option<bool>,
+    ) -> Result<WriteOutcome> {
+        self.execute(
+            id,
+            ACTION_UPDATE,
+            encode::CHECKLIST_KIND,
+            "updated",
+            |replica| {
+                let existing = expect_checklist_item(replica, id)?;
+                let done = completed.unwrap_or(!existing.is_completed());
+                let now = fmt::now_seconds();
+                Ok(if done {
+                    json!({"ss": 3, "sp": now, "md": now})
+                } else {
+                    json!({"ss": 0, "sp": Value::Null, "md": now})
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn delete_checklist_item(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.execute(
+            id,
+            ACTION_DELETE,
+            encode::CHECKLIST_KIND,
+            "deleted",
+            |replica| {
+                expect_checklist_item(replica, id)?;
+                Ok(json!({}))
+            },
+        )
+        .await
+    }
+
     pub async fn update_task(&mut self, id: &str, patch: TaskPatch) -> Result<WriteOutcome> {
         if patch.is_empty() {
             bail!("nothing to update: provide at least one field");
@@ -529,6 +601,12 @@ fn validate_tag_parent(replica: &Replica<'_>, id: &str, parent_id: &str) -> Resu
     Ok(())
 }
 
+fn expect_checklist_item(replica: &Replica<'_>, id: &str) -> Result<crate::things::ChecklistItem> {
+    replica
+        .query(|store| store.checklist_item(id))?
+        .ok_or_else(|| anyhow!("checklist item {id} not found locally"))
+}
+
 fn expect_tag(replica: &Replica<'_>, id: &str) -> Result<crate::things::Tag> {
     replica
         .query(|store| store.get_tag(id))?
@@ -631,6 +709,30 @@ mod tests {
         }
     }
 
+    fn checklist_item(uuid: &str, task: &str, title: &str, index: i64) -> IncomingItem {
+        IncomingItem {
+            uuid: uuid.into(),
+            action: ACTION_CREATE,
+            kind: encode::CHECKLIST_KIND.into(),
+            props: json!({"tt": title, "ss": 0, "ti": task, "ix": index})
+                .as_object()
+                .unwrap()
+                .clone(),
+            server_index: 0,
+        }
+    }
+
+    fn last_commit_entry(fake: &FakeTransport, id: &str) -> Value {
+        let commit = fake
+            .requests()
+            .into_iter()
+            .filter(|request| request.url.contains("/commit"))
+            .next_back()
+            .expect("commit request");
+        let body: Value = serde_json::from_slice(commit.body.as_ref().unwrap()).unwrap();
+        body[id].clone()
+    }
+
     fn last_commit_payload(fake: &FakeTransport, id: &str) -> Value {
         let commit = fake
             .requests()
@@ -650,9 +752,11 @@ mod tests {
     }
 
     fn fake_ok(head: i64) -> Arc<FakeTransport> {
+        let counter = std::sync::atomic::AtomicI64::new(head - 1);
         FakeTransport::new(move |request| {
             if request.url.contains("/commit") {
-                return RawReply::json(200, format!(r#"{{"server-head-index":{head}}}"#));
+                let next = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                return RawReply::json(200, format!(r#"{{"server-head-index":{next}}}"#));
             }
             if request.url.contains("/history/HK") {
                 return RawReply::json(
@@ -1103,6 +1207,138 @@ mod tests {
         };
         let error = service.update_task("task-1", patch).await.unwrap_err();
         assert!(error.to_string().contains("start date"), "{error}");
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|request| !request.url.contains("/commit"))
+        );
+    }
+
+    #[tokio::test]
+    async fn checklist_update_renames_and_reorders() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                task_item("task-1", "t", vec![]),
+                checklist_item("check-1", "task-1", "milk", 0),
+            ],
+        ));
+
+        let outcome = service
+            .update_checklist_item("check-1", Some("oat milk".into()), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(outcome.kind, encode::CHECKLIST_KIND);
+
+        let payload = last_commit_payload(&fake, "check-1");
+        assert_eq!(payload["tt"], "oat milk");
+        assert_eq!(payload["ix"], 3);
+        assert!(payload["md"].is_number());
+        assert_eq!(payload.as_object().unwrap().len(), 3);
+
+        let item = live_store(&service)
+            .checklist_item("check-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.title, "oat milk");
+        assert_eq!(item.index, Some(3));
+    }
+
+    #[tokio::test]
+    async fn checklist_toggle_completes_and_reopens() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                task_item("task-1", "t", vec![]),
+                checklist_item("check-1", "task-1", "milk", 0),
+            ],
+        ));
+
+        service
+            .toggle_checklist_item("check-1", None)
+            .await
+            .unwrap();
+        let payload = last_commit_payload(&fake, "check-1");
+        assert_eq!(payload["ss"], 3);
+        assert!(payload["sp"].is_number());
+        assert!(
+            live_store(&service)
+                .checklist_item("check-1")
+                .unwrap()
+                .unwrap()
+                .is_completed()
+        );
+
+        service
+            .toggle_checklist_item("check-1", None)
+            .await
+            .unwrap();
+        let payload = last_commit_payload(&fake, "check-1");
+        assert_eq!(payload["ss"], 0);
+        assert!(payload["sp"].is_null());
+        assert!(
+            !live_store(&service)
+                .checklist_item("check-1")
+                .unwrap()
+                .unwrap()
+                .is_completed()
+        );
+
+        service
+            .toggle_checklist_item("check-1", Some(true))
+            .await
+            .unwrap();
+        assert_eq!(last_commit_payload(&fake, "check-1")["ss"], 3);
+    }
+
+    #[tokio::test]
+    async fn checklist_delete_sends_a_tombstone() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                task_item("task-1", "t", vec![]),
+                checklist_item("check-1", "task-1", "milk", 0),
+            ],
+        ));
+
+        let outcome = service.delete_checklist_item("check-1").await.unwrap();
+        assert_eq!(outcome.status, "deleted");
+
+        let entry = last_commit_entry(&fake, "check-1");
+        assert_eq!(entry["t"], 2);
+        assert_eq!(entry["e"], encode::CHECKLIST_KIND);
+        assert_eq!(entry["p"], json!({}));
+
+        assert!(
+            live_store(&service)
+                .checklist_item("check-1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            live_store(&service)
+                .checklist_for("task-1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn checklist_update_rejects_an_unknown_item() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![task_item("task-1", "t", vec![])],
+        ));
+
+        let error = service
+            .update_checklist_item("missing", Some("x".into()), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
         assert!(
             fake.requests()
                 .iter()

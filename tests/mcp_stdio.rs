@@ -156,7 +156,7 @@ fn stdio_server_lists_and_calls_tools() {
         .find(|value| value["id"] == 2)
         .expect("tools/list response");
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 33, "tool count");
+    assert_eq!(tools.len(), 36, "tool count");
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -195,6 +195,9 @@ fn stdio_server_lists_and_calls_tools() {
         "restore_task",
         "delete_task",
         "add_checklist_item",
+        "update_checklist_item",
+        "toggle_checklist_item",
+        "delete_checklist_item",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }

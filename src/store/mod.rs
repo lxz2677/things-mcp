@@ -517,6 +517,10 @@ impl Store {
     pub fn checklist_for(&self, task_id: &str) -> Result<Vec<ChecklistItem>> {
         checklist_for(&self.conn, task_id)
     }
+
+    pub fn checklist_item(&self, id: &str) -> Result<Option<ChecklistItem>> {
+        get_checklist_item(&self.conn, id)
+    }
 }
 
 const CURSOR_KEY: &str = "processed_remote_index";

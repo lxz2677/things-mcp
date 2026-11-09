@@ -13,6 +13,10 @@ Add each release under a `## vX.Y.Z` heading. The release workflow uses that sec
 
 - Create and update repeating tasks: daily/weekly/monthly/yearly, every N periods, weekday sets, an optional end date, and after-completion repeats. `create_task` / `update_task` take `repeat`; `update_task` takes `clear_repeat`; the CLI uses `--repeat`, `--repeat-interval`, `--repeat-end`, and `--clear-repeat`. Rules are validated before pushing and written to both `rr` and `rp`.
 
+## Unreleased
+
+- Manage checklist items end to end: rename/reorder, complete/reopen (toggle), and delete. New MCP tools `update_checklist_item`, `toggle_checklist_item`, `delete_checklist_item`; new CLI commands `update-checklist`, `toggle-checklist`, `delete-checklist`.
+
 ## v0.2.1
 
 - Set a local reminder time (`HH:MM`) when creating or updating a task or project with a start date. Use `--remind` in the CLI or `reminder` in MCP. For example, create a task with `--when tomorrow --remind 09:00`.
