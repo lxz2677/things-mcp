@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use crate::fmt;
-use crate::store::Store;
+use crate::store::{CompatCheck, Store};
 use crate::things::{
     HistoryMeta, IncomingItem, SUPPORTED_SCHEMA, ThingsClient, ThingsError, parse_entity_name,
     supported_entity_max,
@@ -42,36 +41,6 @@ pub struct SyncReport {
     pub full_reset: bool,
     pub history_replaced: bool,
     pub(crate) generation: i64,
-    pub(crate) cloud_schema: i64,
-    pub(crate) cloud_entities: BTreeMap<String, u32>,
-}
-
-#[derive(Debug)]
-struct IncompatibleVersion {
-    reason: String,
-    schema: Option<i64>,
-    entities: BTreeMap<String, u32>,
-}
-
-impl std::fmt::Display for IncompatibleVersion {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.reason)
-    }
-}
-
-impl std::error::Error for IncompatibleVersion {}
-
-fn incompatible(
-    reason: String,
-    schema: Option<i64>,
-    entities: &BTreeMap<String, u32>,
-) -> anyhow::Error {
-    IncompatibleVersion {
-        reason,
-        schema,
-        entities: entities.clone(),
-    }
-    .into()
 }
 
 impl SyncEngine {
@@ -92,7 +61,9 @@ impl SyncEngine {
     }
 
     pub async fn sync(&mut self, full: bool) -> Result<SyncReport> {
+        let mut check = self.store.begin_compat_check()?;
         let state = self.store.sync_state()?;
+        let full = full || self.store.needs_compat_replay(&state)?;
         let (history_key, meta, mut history_replaced) =
             resolve_history(&self.client, state.history_key.as_deref()).await?;
         if state.cursor > meta.latest_server_index {
@@ -121,11 +92,13 @@ impl SyncEngine {
                 &mut staged,
                 &mut report,
                 meta.latest_schema_version,
+                &mut check,
             )
             .await;
             if result.is_ok() {
                 drop(staged);
-                self.store.replace_replica(&path, &state)?;
+                self.store
+                    .replace_replica(&path, &state, report.head, &check)?;
                 report.generation = state.generation + 1;
             }
             result
@@ -140,29 +113,28 @@ impl SyncEngine {
                 &mut self.store,
                 &mut report,
                 meta.latest_schema_version,
+                &mut check,
             )
             .await
         };
 
-        match pull_result {
-            Ok(()) => {
-                self.store
-                    .set_compat_ok(report.cloud_schema, &report.cloud_entities)?;
+        if let Err(error) = pull_result {
+            if let Some(ThingsError::IncompatibleVersion(reason)) = error.downcast_ref() {
+                self.store.record_incompatible(&check, reason)?;
             }
-            Err(error) => {
-                if let Some(incompatible) = error.downcast_ref::<IncompatibleVersion>() {
-                    self.store.set_compat_incompatible(
-                        &incompatible.reason,
-                        incompatible.schema,
-                        &incompatible.entities,
-                    )?;
-                    return Err(
-                        ThingsError::IncompatibleVersion(incompatible.reason.clone()).into(),
-                    );
-                }
-                return Err(error);
-            }
+            return Err(error);
         }
+        if !(full || history_replaced) {
+            self.store
+                .finish_sync(&report.history_key, report.generation, report.head, &check)?;
+        }
+        tracing::info!(
+            pages = report.pages,
+            items = report.items,
+            cursor = report.cursor,
+            head = report.head,
+            "sync finished"
+        );
         Ok(report)
     }
 }
@@ -200,21 +172,13 @@ async fn pull_history(
     store: &mut Store,
     report: &mut SyncReport,
     schema: i64,
+    check: &mut CompatCheck,
 ) -> Result<()> {
     let history_key = &report.history_key;
     let mut cursor = report.cursor;
     let mut head = report.head;
-    let mut cloud_schema = schema;
-    let mut cloud_entities: BTreeMap<String, u32> = BTreeMap::new();
     tracing::info!(history_key = %history_key, cursor, head, "sync started");
-
-    if schema != 0 && schema != SUPPORTED_SCHEMA {
-        return Err(incompatible(
-            format!("cloud schema {schema} (supported {SUPPORTED_SCHEMA})"),
-            Some(schema),
-            &cloud_entities,
-        ));
-    }
+    check_schema(schema, check)?;
 
     let mut pages = 0usize;
     let mut empty_pages = 0usize;
@@ -226,26 +190,9 @@ async fn pull_history(
 
         let page = client.items_page(history_key, cursor as usize).await?;
 
-        if page.schema != 0 {
-            if page.schema != SUPPORTED_SCHEMA {
-                return Err(incompatible(
-                    format!(
-                        "cloud schema {} (supported {SUPPORTED_SCHEMA})",
-                        page.schema
-                    ),
-                    Some(page.schema),
-                    &cloud_entities,
-                ));
-            }
-            cloud_schema = cloud_schema.max(page.schema);
-        }
-        if let Err(error) = check_items(&page.items, &mut cloud_entities) {
-            return Err(incompatible(
-                error.to_string(),
-                Some(cloud_schema),
-                &cloud_entities,
-            ));
-        }
+        check_schema(page.schema, check)?;
+        check_items(&page.items, &mut check.entities)
+            .map_err(|error| ThingsError::IncompatibleVersion(error.to_string()))?;
 
         if page.batches == 0 {
             empty_pages += 1;
@@ -262,6 +209,7 @@ async fn pull_history(
                 "empty page below head; re-reading history meta"
             );
             let refreshed = client.history_meta(history_key).await?;
+            check_schema(refreshed.latest_schema_version, check)?;
             head = head.max(refreshed.latest_server_index);
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -301,20 +249,23 @@ async fn pull_history(
     }
 
     head = head.max(cursor);
-    report.cloud_schema = cloud_schema;
-    report.cloud_entities = cloud_entities;
-    store.finish_sync(
-        history_key,
-        report.generation,
-        schema,
-        head,
-        &fmt::now_rfc3339(),
-    )?;
-    tracing::info!(pages, items = report.items, cursor, head, "sync finished");
 
     report.cursor = cursor;
     report.head = head;
     report.pages = pages;
+    Ok(())
+}
+
+fn check_schema(schema: i64, check: &mut CompatCheck) -> Result<()> {
+    if schema != 0 {
+        check.schema = Some(schema);
+        if schema != SUPPORTED_SCHEMA {
+            return Err(ThingsError::IncompatibleVersion(format!(
+                "cloud schema {schema} (supported {SUPPORTED_SCHEMA})"
+            ))
+            .into());
+        }
+    }
     Ok(())
 }
 

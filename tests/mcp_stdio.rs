@@ -345,3 +345,41 @@ fn incompatible_replica_returns_a_readable_tool_error() {
         "the text content must tell the agent what to do"
     );
 }
+
+#[test]
+fn update_project_can_set_and_clear_a_reminder() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("things.sqlite");
+    Store::open(&db)
+        .unwrap()
+        .apply_items(&[IncomingItem {
+            uuid: "project-1".into(),
+            action: ACTION_CREATE,
+            kind: "Task7".into(),
+            props: json!({"tt":"Project","tp":1,"st":2,"sr":1794700800,"ato":32400})
+                .as_object()
+                .unwrap()
+                .clone(),
+            server_index: 0,
+        }])
+        .unwrap();
+
+    let set = call_tool(
+        &db,
+        "update_project",
+        json!({"id":"project-1","reminder":"15:45","dry_run":true}),
+    );
+    assert_eq!(set["isError"], false);
+    assert_eq!(set["structuredContent"]["payload"]["ato"], 56_700);
+
+    let clear = call_tool(
+        &db,
+        "update_project",
+        json!({"id":"project-1","clear_reminder":true,"dry_run":true}),
+    );
+    assert_eq!(clear["isError"], false);
+    assert_eq!(
+        clear["structuredContent"]["payload"].get("ato"),
+        Some(&Value::Null)
+    );
+}

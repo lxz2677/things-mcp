@@ -6,7 +6,7 @@ use std::sync::Arc;
 use things_mcp::store::Store;
 use things_mcp::sync::SyncEngine;
 use things_mcp::testing::FakeTransport;
-use things_mcp::things::{ClientOptions, RawReply, ThingsClient};
+use things_mcp::things::{ClientOptions, IncomingItem, RawReply, ThingsClient, ThingsError};
 
 const OWN: &str =
     r#"{"history-key":"HK","is-empty":false,"latest-schema-version":301,"latest-server-index":1}"#;
@@ -133,5 +133,92 @@ async fn a_successful_sync_clears_a_previous_incompatibility() {
     let mut engine = SyncEngine::new(client(fake), store);
     engine.sync(false).await.unwrap();
     engine.store().ensure_compatible().unwrap();
-    assert!(engine.store().compat().unwrap().ok);
+    let compat = engine.store().compat().unwrap();
+    assert!(compat.ok);
+    assert_eq!(compat.cloud_schema, Some(301));
+    assert_eq!(compat.reason, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_syncs_do_not_lose_incompatibility() {
+    let dir = tempfile::tempdir().unwrap();
+    for (full, older_schema, newer_schema) in
+        [(false, 301, 302), (true, 301, 302), (false, 302, 301)]
+    {
+        let path = dir
+            .path()
+            .join(format!("replica-{full}-{older_schema}.sqlite"));
+        let store = Store::open(&path).unwrap();
+        store.set_history_key("HK").unwrap();
+
+        let older_cloud = FakeTransport::new(move |request| {
+            assert!(request.url.ends_with("/history/HK"));
+            // Finish a newer sync while the older one is waiting for its
+            // already captured response. Use a separate SQLite connection.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let newer_cloud = FakeTransport::new(move |_| {
+                        RawReply::json(200, empty_history_meta(newer_schema))
+                    });
+                    let mut newer =
+                        SyncEngine::new(client(newer_cloud), Store::open(&path).unwrap());
+                    let result = newer.sync(false).await;
+                    assert_eq!(result.is_ok(), newer_schema == 301, "{result:?}");
+                });
+            });
+            RawReply::json(200, empty_history_meta(older_schema))
+        });
+        let mut older = SyncEngine::new(client(older_cloud), store);
+
+        let error = older.sync(full).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ThingsError::IncompatibleVersion(reason)) if reason.contains("302")
+        ));
+        assert!(older.store().ensure_compatible().is_err());
+        assert_eq!(older.store().compat().unwrap().cloud_schema, Some(302));
+        assert_eq!(
+            older.store().last_sync_at().unwrap().is_some(),
+            newer_schema == 301
+        );
+    }
+}
+
+fn empty_history_meta(schema: i64) -> String {
+    format!(r#"{{"latest-server-index":0,"latest-schema-version":{schema}}}"#)
+}
+
+#[tokio::test]
+async fn revalidates_history_even_at_the_cloud_head_on_upgrade() {
+    let mut engine = engine(
+        301,
+        301,
+        r#"{"u":{"t":0,"e":"Task8","p":{"tt":"from cloud"}}}"#,
+    );
+    let store = engine.store_mut();
+    store.set_history_key("HK").unwrap();
+    store.meta_set("compat_status", "ok").unwrap(); // Set by the old incremental check.
+    store
+        .apply_page(
+            0,
+            &[IncomingItem {
+                uuid: "u".into(),
+                action: 0,
+                kind: "Task8".into(),
+                props: serde_json::from_str(r#"{"tt":"legacy copy"}"#).unwrap(),
+                server_index: 0,
+            }],
+            1,
+        )
+        .unwrap()
+        .unwrap();
+
+    let error = engine.sync(false).await.unwrap_err();
+    assert!(error.to_string().contains("Task8"), "{error}");
+    assert!(engine.store().ensure_compatible().is_err());
+    assert_eq!(engine.store().cursor().unwrap(), 1);
+    assert_eq!(
+        engine.store().get_task("u").unwrap().unwrap().title,
+        "legacy copy"
+    );
 }

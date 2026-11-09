@@ -76,6 +76,8 @@
 
 设置提醒时，任务或项目需要有开始日期。例如，运行 `things-mcp create "打电话" --when tomorrow --remind 09:00`，或在 MCP 的 `create_task` 工具中传入 `when: "tomorrow"` 和 `reminder: "09:00"`。要清除提醒，用 CLI 的 `update --clear-remind`，或在 `update_task` 中传入 `clear_reminder: true`。
 
+更新项目提醒时，CLI 使用 `update-project` 的 `--remind` 或 `--clear-remind`，MCP 使用 `update_project` 的 `reminder` 或 `clear_reminder: true`。
+
 ## 兼容性
 
 每次 sync 都会把云端的版本标记和本构建支持的范围比对：
@@ -86,7 +88,7 @@
 
 一旦发现更新：sync 立即停止并把状态写入本地；之后 MCP 的所有数据操作会返回 **工具结果**（`isError: true`）并带上结构化的 `INCOMPATIBLE_VERSION`（含 `message`、`do_not_retry`、`remediation`），Agent 可以直接读到并停止；CLI 数据命令以错误退出。两者都不会读写副本。`sync`、`verify`、`doctor`、`account` 仍可运行，方便升级后重新检测。`verify`、`doctor`、`sync_status` 会显示上次检测结果。
 
-检测发生在 sync 时；写操作本来就会先 sync，所以会在 commit 前被拦住。
+同步时执行检测。写操作会先同步，因此能在提交前拦截不兼容的版本。旧副本首次同步时会重放历史，验证后再标记为兼容。
 
 ## 卸载
 

@@ -243,7 +243,7 @@ impl RepeatSpec {
             }
             Frequency::Monthly => {
                 let day = self.day.unwrap_or(start.day() as i32);
-                if day == 0 || day < -1 || day > 31 {
+                if !matches!(day, -1 | 1..=31) {
                     bail!("monthly repeat day must be 1-31 or -1 (got {day})");
                 }
                 let first = first_monthly(start, day)?;
@@ -255,7 +255,7 @@ impl RepeatSpec {
                 if !(1..=12).contains(&month) {
                     bail!("yearly repeat month must be 1-12 (got {month})");
                 }
-                if day == 0 || day < -1 || day > 31 {
+                if !matches!(day, -1 | 1..=31) {
                     bail!("yearly repeat day must be 1-31 or -1 (got {day})");
                 }
                 let first = first_yearly(start, month, day)?;
@@ -264,7 +264,18 @@ impl RepeatSpec {
         };
 
         let end = match &self.end_date {
-            Some(value) => fmt::day_to_wire(parse_day(value)?),
+            Some(value) => {
+                let end = parse_day(value)?;
+                let first_possible_day = match self.repeat_type {
+                    RepeatType::Scheduled => first_day,
+                    RepeatType::AfterCompletion => start_day,
+                };
+                anyhow::ensure!(
+                    end >= first_possible_day,
+                    "repeat end date is before the first possible occurrence"
+                );
+                fmt::day_to_wire(end)
+            }
             None => NEVER_ENDS,
         };
         let (tp, ia, of) = match self.repeat_type {
@@ -1049,6 +1060,21 @@ mod tests {
         rule["fu"] = json!(16);
         rule["fa"] = json!(0);
         assert!(validate_repeater(&rule).is_err());
+    }
+
+    #[test]
+    fn repeat_end_date_cannot_precede_the_first_occurrence() {
+        let start = parse_day("2026-11-08").unwrap(); // Sunday
+        let mut weekly = RepeatSpec::parse("weekly:mon", 1, Some("2026-11-08".into())).unwrap();
+        let error = weekly.build(start).unwrap_err();
+        assert!(error.to_string().contains("before the first"), "{error}");
+        weekly.end_date = Some("2026-11-09".into());
+        let rule = weekly.build(start).unwrap();
+        assert_eq!(rule["ed"], rule["ia"]);
+
+        let after_completion =
+            RepeatSpec::parse("after-completion:daily", 1, Some("2026-11-07".into())).unwrap();
+        assert!(after_completion.build(start).is_err());
     }
 
     fn daily_spec() -> RepeatSpec {

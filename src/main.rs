@@ -379,7 +379,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Update a project (title, notes, dates, area, tags, repeat).
+    /// Update a project (title, notes, dates, area, tags, reminder, repeat).
     UpdateProject {
         id: String,
         #[arg(long)]
@@ -400,6 +400,11 @@ enum Command {
         tag: Vec<String>,
         #[arg(long)]
         clear_tags: bool,
+        /// Reminder time in local time, HH:MM. The project needs a start date.
+        #[arg(long)]
+        remind: Option<String>,
+        #[arg(long)]
+        clear_remind: bool,
         #[arg(long)]
         repeat: Option<String>,
         #[arg(long, default_value_t = 1)]
@@ -739,6 +744,8 @@ async fn main() -> Result<()> {
             clear_area,
             tag,
             clear_tags,
+            remind,
+            clear_remind,
             repeat,
             repeat_interval,
             repeat_end,
@@ -763,6 +770,7 @@ async fn main() -> Result<()> {
                 clear_area,
                 tag,
                 clear_tags,
+                TaskPatch::parse_reminder(remind.as_deref(), clear_remind)?,
                 repeat,
                 dry_run,
             )
@@ -1022,15 +1030,7 @@ async fn write_update(
     } else {
         Some(tags)
     };
-    let reminder_time = if clear_remind {
-        Some(None)
-    } else {
-        remind
-            .as_deref()
-            .map(things_mcp::things::parse_reminder)
-            .transpose()?
-            .map(Some)
-    };
+    let reminder_time = TaskPatch::parse_reminder(remind.as_deref(), clear_remind)?;
 
     let patch = TaskPatch {
         title,
@@ -1152,6 +1152,7 @@ async fn write_update_project(
     clear_area: bool,
     tags: Vec<String>,
     clear_tags: bool,
+    reminder_time: Option<Option<i64>>,
     repeat: Option<Option<RepeatSpec>>,
     dry_run: bool,
 ) -> Result<()> {
@@ -1185,7 +1186,7 @@ async fn write_update_project(
         area,
         heading: None,
         tags,
-        reminder_time: None,
+        reminder_time,
         repeat,
     };
     let mut service = write_service(config, dry_run).await?;

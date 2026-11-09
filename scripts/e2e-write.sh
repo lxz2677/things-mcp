@@ -51,7 +51,7 @@ assert task["status"] == sys.argv[1], task
 }
 assert_reminder() {
   reader sync
-  reader show "$id" | python3 -c '
+  reader show "${2:-$id}" | python3 -c '
 import json, sys
 task = json.load(sys.stdin)
 assert task["reminder"] == (sys.argv[1] or None), task
@@ -93,3 +93,10 @@ sync = json.load(sys.stdin)
 assert sync["deleted"] == 1 and sync["tasks"] == 0, sync
 '
 reader check
+
+project_id="$("$BIN" create-project "E2E project" --when tomorrow |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])')"
+"$BIN" update-project "$project_id" --remind 15:45
+assert_reminder 15:45 "$project_id"
+"$BIN" update-project "$project_id" --clear-remind
+assert_reminder '' "$project_id"

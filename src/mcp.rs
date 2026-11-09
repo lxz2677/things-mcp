@@ -21,8 +21,9 @@ use crate::config::Config;
 use crate::fmt;
 use crate::ids;
 use crate::store::{
-    ListKind, SearchFilter, Store, area_detail, count_tasks, list_areas, list_projects, list_tags,
-    list_tasks, project_detail, search_tasks, summaries, tag_detail, task_counts, task_detail,
+    CompatStatus, ListKind, SearchFilter, Store, area_detail, count_tasks, list_areas,
+    list_projects, list_tags, list_tasks, project_detail, search_tasks, summaries, tag_detail,
+    task_counts, task_detail,
 };
 use crate::sync::{SyncEngine, SyncReport};
 use crate::things::{
@@ -121,17 +122,17 @@ impl ThingsServer {
             }
         };
         if let Err(error) = store.ensure_compatible() {
-            return Err(self.incompatible_result(&store, &error));
+            return Err(self.incompatible_result(store.compat().ok(), &error.to_string()));
         }
         Ok(store)
     }
 
-    fn incompatible_result(&self, store: &Store, error: &anyhow::Error) -> CallToolResult {
-        let compat = store.compat().ok();
+    fn incompatible_result(&self, compat: Option<CompatStatus>, fallback: &str) -> CallToolResult {
+        let compat = compat.filter(|compat| compat.checked && !compat.ok);
         let reason = compat
             .as_ref()
-            .and_then(|compat| compat.reason.clone())
-            .unwrap_or_else(|| error.to_string());
+            .and_then(|compat| compat.reason.as_deref())
+            .unwrap_or(fallback);
         tool_error(
             "INCOMPATIBLE_VERSION",
             format!(
@@ -151,6 +152,26 @@ impl ThingsServer {
                 ],
             }),
         )
+    }
+
+    fn finish_tool_call(
+        &self,
+        result: Result<CallToolResponse, McpError>,
+    ) -> Result<CallToolResponse, McpError> {
+        match result {
+            Err(error)
+                if error.data.as_ref().and_then(|data| data["code"].as_str())
+                    == Some("INCOMPATIBLE_VERSION") =>
+            {
+                let compat = Store::read_compat(&self.state.config.db_path)
+                    .ok()
+                    .flatten();
+                Ok(CallToolResponse::Complete(
+                    self.incompatible_result(compat, &error.message),
+                ))
+            }
+            result => result,
+        }
     }
 
     fn build_client(&self, store: &Store) -> Result<ThingsClient, McpError> {
@@ -418,6 +439,9 @@ pub struct UpdateProjectArgs {
     pub clear_area: Option<bool>,
     pub tags: Option<Vec<String>>,
     pub clear_tags: Option<bool>,
+    /// Reminder time in local time, `HH:MM`. The project needs a start date.
+    pub reminder: Option<String>,
+    pub clear_reminder: Option<bool>,
     pub repeat: Option<RepeatSpec>,
     pub clear_repeat: Option<bool>,
     pub dry_run: Option<bool>,
@@ -543,7 +567,7 @@ impl ThingsServer {
             }
         };
         if let Err(error) = store.ensure_compatible() {
-            return Err(self.incompatible_result(&store, &error));
+            return Err(self.incompatible_result(store.compat().ok(), &error.to_string()));
         }
 
         if dry_run {
@@ -1013,16 +1037,11 @@ impl ThingsServer {
         } else {
             args.repeat.map(Some)
         };
-        let reminder_time = if args.clear_reminder.unwrap_or(false) {
-            Some(None)
-        } else {
-            args.reminder
-                .as_deref()
-                .map(parse_reminder)
-                .transpose()
-                .map_err(invalid_param)?
-                .map(Some)
-        };
+        let reminder_time = TaskPatch::parse_reminder(
+            args.reminder.as_deref(),
+            args.clear_reminder.unwrap_or(false),
+        )
+        .map_err(invalid_param)?;
 
         let patch = TaskPatch {
             title: args.title,
@@ -1287,25 +1306,9 @@ impl ThingsServer {
         &self,
         Parameters(args): Parameters<SyncNowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let report = match self.refresh(true, args.full).await {
-            Ok(Some(report)) => report,
-            Ok(None) => {
-                return Err(McpError::internal_error(
-                    "sync did not run",
-                    Some(json!({"code": "SYNC_SKIPPED"})),
-                ));
-            }
-            Err(error) => {
-                if error.message.to_lowercase().contains("incompatible") {
-                    return Ok(tool_error(
-                        "INCOMPATIBLE_VERSION",
-                        error.message.to_string(),
-                        json!({"do_not_retry": true}),
-                    ));
-                }
-                return Err(error);
-            }
-        };
+        let report = self.refresh(true, args.full).await?.ok_or_else(|| {
+            McpError::internal_error("sync did not run", Some(json!({"code": "SYNC_SKIPPED"})))
+        })?;
         let store = self.open_store_raw()?;
         let payload = json!({
             "history_key": report.history_key,
@@ -1397,7 +1400,7 @@ impl ThingsServer {
         ))
     }
 
-    #[tool(description = "Update a project (title, notes, dates, area, tags, repeat).")]
+    #[tool(description = "Update a project (title, notes, dates, area, tags, reminder, repeat).")]
     async fn update_project(
         &self,
         Parameters(args): Parameters<UpdateProjectArgs>,
@@ -1428,6 +1431,11 @@ impl ThingsServer {
         } else {
             args.repeat.map(Some)
         };
+        let reminder_time = TaskPatch::parse_reminder(
+            args.reminder.as_deref(),
+            args.clear_reminder.unwrap_or(false),
+        )
+        .map_err(invalid_param)?;
         let patch = TaskPatch {
             title: args.title,
             notes: args.notes,
@@ -1442,7 +1450,7 @@ impl ThingsServer {
             area,
             heading: None,
             tags,
-            reminder_time: None,
+            reminder_time,
             repeat,
         };
 
@@ -1585,6 +1593,7 @@ impl rmcp::ServerHandler for ThingsServer {
             .tool_router
             .call(ToolCallContext::new(self, request, context))
             .await;
+        let result = self.finish_tool_call(result);
         let elapsed_ms = started.elapsed().as_millis();
         match &result {
             Ok(response) => {
@@ -1712,7 +1721,8 @@ pub async fn run(config: Config, refresh_secs: u64) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::things::{ACTION_CREATE, IncomingItem};
+    use crate::testing::FakeTransport;
+    use crate::things::{ACTION_CREATE, IncomingItem, RawReply};
 
     fn seed(path: &std::path::Path) {
         let mut store = Store::open(path).unwrap();
@@ -1823,6 +1833,42 @@ mod tests {
             server.open_store_raw().is_ok(),
             "diagnostics must still work"
         );
+    }
+
+    #[tokio::test]
+    async fn first_incompatible_write_returns_a_structured_tool_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("things.sqlite");
+        let store = Store::open(&db).unwrap();
+        store.set_history_key("HK").unwrap();
+        assert!(!store.compat().unwrap().checked);
+
+        let cloud = FakeTransport::new(|request| {
+            assert!(request.url.ends_with("/history/HK"), "{}", request.url);
+            RawReply::json(
+                200,
+                r#"{"latest-server-index":0,"latest-schema-version":302}"#,
+            )
+        });
+        let client = ThingsClient::new(cloud, ClientOptions::new("me@example.com", "pw", "app"));
+        let mut service = WriteService::live(SyncEngine::new(client, store));
+        let error = service
+            .create_task(TaskDraft::new("test"))
+            .await
+            .unwrap_err();
+        let CallToolResponse::Complete(result) = server(&db)
+            .finish_tool_call(Err(write_error(error)))
+            .unwrap()
+        else {
+            panic!("expected a completed tool result");
+        };
+
+        assert_eq!(result.is_error, Some(true));
+        let payload = result.structured_content.unwrap();
+        assert_eq!(payload["error"], "INCOMPATIBLE_VERSION");
+        assert_eq!(payload["details"]["cloud_schema"], 302);
+        assert_eq!(payload["details"]["do_not_retry"], true);
+        assert!(payload["details"]["remediation"].is_array());
     }
 
     #[test]

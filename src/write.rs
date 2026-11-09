@@ -35,6 +35,13 @@ pub struct TaskPatch {
 }
 
 impl TaskPatch {
+    pub fn parse_reminder(value: Option<&str>, clear: bool) -> Result<Option<Option<i64>>> {
+        if clear {
+            return Ok(Some(None));
+        }
+        Ok(value.map(encode::parse_reminder).transpose()?.map(Some))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.title.is_none()
             && self.notes.is_none()
@@ -180,6 +187,7 @@ impl WriteService {
                     && *title != existing.title
                 {
                     delta.insert("tt".into(), json!(title));
+                    delta.insert("md".into(), json!(fmt::now_seconds()));
                 }
                 if let Some(index) = index
                     && Some(index) != existing.index
@@ -189,7 +197,6 @@ impl WriteService {
                 if delta.is_empty() {
                     bail!("nothing changed");
                 }
-                delta.insert("md".into(), json!(fmt::now_seconds()));
                 Ok(Value::Object(delta))
             },
         )
@@ -251,13 +258,12 @@ impl WriteService {
         if patch.is_empty() {
             bail!("nothing to update: provide at least one field");
         }
-        if expected == TYPE_PROJECT
-            && (patch.project.is_some() || patch.heading.is_some() || patch.reminder_time.is_some())
-        {
-            bail!("projects cannot have a parent project, a heading, or a reminder");
+        if expected == TYPE_PROJECT && (patch.project.is_some() || patch.heading.is_some()) {
+            bail!("projects cannot have a parent project or a heading");
         }
         self.execute(id, ACTION_UPDATE, encode::TASK_KIND, "updated", |replica| {
             let existing = expect_entity(replica, id, expected)?;
+            let today = fmt::today_epoch_day();
             validate_container(
                 replica,
                 patch.project.as_ref().and_then(|id| id.as_deref()),
@@ -279,7 +285,7 @@ impl WriteService {
                 delta.insert("nt".into(), encode::notes_object(notes));
             }
             if let Some(when) = &patch.when {
-                let (st, sr, tir, sb) = when.fields(fmt::today_epoch_day());
+                let (st, sr, tir, sb) = when.fields(today);
                 delta.insert("st".into(), json!(st));
                 delta.insert("sr".into(), json!(sr.map(fmt::day_to_wire)));
                 delta.insert("tir".into(), json!(tir.map(fmt::day_to_wire)));
@@ -323,16 +329,15 @@ impl WriteService {
             if let Some(repeat) = &patch.repeat {
                 match repeat {
                     Some(spec) => {
-                        let start = patch
-                            .when
-                            .as_ref()
-                            .and_then(|when| when.day(fmt::today_epoch_day()))
-                            .or(existing.start_date)
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "task has no start date; pass `when` together with the repeat rule"
-                                )
-                            })?;
+                        let start = match &patch.when {
+                            Some(when) => when.day(today),
+                            None => existing.start_date,
+                        }
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "task has no start date; pass a dated `when` with the repeat rule"
+                            )
+                        })?;
                         let rule = spec.build(start)?;
                         delta.insert("rr".into(), rule.clone());
                         delta.insert("rp".into(), rule);
@@ -366,6 +371,7 @@ impl WriteService {
                 && *title != existing.title
             {
                 delta.insert("tt".into(), json!(title));
+                delta.insert("md".into(), json!(fmt::now_seconds()));
             }
             if let Some(index) = index
                 && Some(index) != existing.index
@@ -375,7 +381,6 @@ impl WriteService {
             if delta.is_empty() {
                 bail!("nothing changed");
             }
-            delta.insert("md".into(), json!(fmt::now_seconds()));
             Ok(Value::Object(delta))
         })
         .await
@@ -895,22 +900,14 @@ mod tests {
         let commit = fake
             .requests()
             .into_iter()
-            .filter(|request| request.url.contains("/commit"))
-            .next_back()
+            .rfind(|request| request.url.contains("/commit"))
             .expect("commit request");
         let body: Value = serde_json::from_slice(commit.body.as_ref().unwrap()).unwrap();
         body[id].clone()
     }
 
     fn last_commit_payload(fake: &FakeTransport, id: &str) -> Value {
-        let commit = fake
-            .requests()
-            .into_iter()
-            .filter(|request| request.url.contains("/commit"))
-            .next_back()
-            .expect("commit request");
-        let body: Value = serde_json::from_slice(commit.body.as_ref().unwrap()).unwrap();
-        body[id]["p"].clone()
+        last_commit_entry(fake, id)["p"].clone()
     }
 
     fn live_store(service: &WriteService) -> &Store {
@@ -1384,6 +1381,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setting_repeat_cannot_clear_the_start_date_in_the_same_update() {
+        let fake = fake_ok(1);
+        let mut task = task_item("task-1", "t", vec![]);
+        task.props
+            .insert("sr".into(), json!(fmt::day_to_wire(20765)));
+        let mut service = WriteService::live(engine_with(fake.clone(), vec![task]));
+
+        let error = service
+            .update_task(
+                "task-1",
+                TaskPatch {
+                    when: Some(When::Someday),
+                    repeat: Some(Some(weekly_spec())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("start date"), "{error}");
+        assert!(fake.urls().iter().all(|url| !url.contains("/commit")));
+    }
+
+    #[tokio::test]
     async fn checklist_update_renames_and_reorders() {
         let fake = fake_ok(1);
         let mut service = WriteService::live(engine_with(
@@ -1412,6 +1432,11 @@ mod tests {
             .unwrap();
         assert_eq!(item.title, "oat milk");
         assert_eq!(item.index, Some(3));
+        let outcome = service
+            .update_checklist_item("check-1", None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(outcome.payload, json!({"ix": 2}));
     }
 
     #[tokio::test]
@@ -1562,6 +1587,12 @@ mod tests {
         assert_eq!(payload["ix"], 1);
         assert!(payload["md"].is_number());
         assert_eq!(payload.as_object().unwrap().len(), 3);
+
+        let outcome = service
+            .update_heading("heading-1", None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(outcome.payload, json!({"ix": 2}));
 
         let error = service
             .update_heading("project-1", Some("nope".into()), None)

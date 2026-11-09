@@ -76,6 +76,8 @@ Restart the client and ask the agent to list your Today tasks.
 
 To set a reminder, give the item a start date. For example, run `things-mcp create "Call Sam" --when tomorrow --remind 09:00`, or pass `when: "tomorrow"` and `reminder: "09:00"` to the MCP tool `create_task`. Use `update --clear-remind` in the CLI or `clear_reminder: true` in `update_task` to remove it.
 
+For projects, use `update-project` with `--remind` or `--clear-remind`, or pass `reminder` or `clear_reminder: true` to `update_project`.
+
 ## Compatibility
 
 Every sync compares the cloud's version markers with what this build supports:
@@ -86,7 +88,7 @@ Every sync compares the cloud's version markers with what this build supports:
 
 When something is newer, the sync stops, the state is stored locally, and every MCP data operation returns a **tool result** with `isError: true` and a structured `INCOMPATIBLE_VERSION` payload (`message`, `do_not_retry`, `remediation`) so the agent can read it and stop. CLI data commands exit with an error. Neither touches the replica. `sync`, `verify`, `doctor`, and `account` still run so you can re-check after upgrading things-mcp. `verify`, `doctor`, and `sync_status` show the last check.
 
-Detection happens at sync time. Writes always sync first, so they are blocked before any commit.
+Detection happens at sync time. Writes always sync first, so they are blocked before any commit. The first sync of an older, unvalidated replica replays its history before marking it compatible.
 
 ## Uninstall
 

@@ -20,16 +20,19 @@ pub use query::{
     search_tasks, summaries, tag_detail, task_counts, task_detail,
 };
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde_json::Value;
 
 use crate::things::model::{Area, ChecklistItem, EntityKind, Tag, Task};
 use crate::things::wire;
-use crate::things::{ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem};
+use crate::things::{ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem, ThingsError};
 
 /// Bump when adding tables/columns; `init` applies migrations for older files.
 const SCHEMA_VERSION: i64 = 2;
@@ -52,8 +55,14 @@ pub struct CompatStatus {
     pub ok: bool,
     pub reason: Option<String>,
     pub cloud_schema: Option<i64>,
-    pub entities: std::collections::BTreeMap<String, u32>,
+    pub entities: BTreeMap<String, u32>,
     pub checked_at: Option<String>,
+}
+
+pub(crate) struct CompatCheck {
+    block_revision: i64,
+    pub schema: Option<i64>,
+    pub entities: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -199,71 +208,39 @@ impl Store {
     // -------------------------------------------------------- compatibility
 
     pub fn compat(&self) -> Result<CompatStatus> {
-        let status = self.meta_get("compat_status")?;
-        Ok(CompatStatus {
-            checked: status.is_some(),
-            ok: status.as_deref() == Some("ok"),
-            reason: self.meta_get("compat_reason")?,
-            cloud_schema: meta_i64(&self.conn, "compat_cloud_schema")?,
-            entities: self
-                .meta_get("compat_entities")?
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default(),
-            checked_at: self.meta_get("compat_checked_at")?,
-        })
+        compat(&self.conn)
     }
 
-    pub fn set_compat_ok(
-        &self,
-        schema: i64,
-        entities: &std::collections::BTreeMap<String, u32>,
-    ) -> Result<()> {
-        let existing = self.compat()?;
-        let mut merged = existing.entities.clone();
-        for (base, generation) in entities {
-            merged
-                .entry(base.clone())
-                .and_modify(|current| *current = (*current).max(*generation))
-                .or_insert(*generation);
-        }
-        let schema = schema.max(existing.cloud_schema.unwrap_or(0));
-        self.set_compat("ok", None, schema, &merged)
+    pub(crate) fn begin_compat_check(&self) -> Result<CompatCheck> {
+        Ok(CompatCheck {
+            block_revision: meta_i64(&self.conn, "compat_block_revision")?.unwrap_or(0),
+            schema: None,
+            entities: BTreeMap::new(),
+        })
     }
 
     pub fn set_compat_incompatible(
         &self,
         reason: &str,
         schema: Option<i64>,
-        entities: &std::collections::BTreeMap<String, u32>,
+        entities: &BTreeMap<String, u32>,
     ) -> Result<()> {
-        let existing = self.compat()?;
-        let mut merged = existing.entities.clone();
-        for (base, generation) in entities {
-            merged
-                .entry(base.clone())
-                .and_modify(|current| *current = (*current).max(*generation))
-                .or_insert(*generation);
-        }
-        let schema = schema.unwrap_or(0).max(existing.cloud_schema.unwrap_or(0));
-        self.set_compat("incompatible", Some(reason), schema, &merged)
+        let mut check = self.begin_compat_check()?;
+        check.schema = schema;
+        check.entities.clone_from(entities);
+        self.record_incompatible(&check, reason)
     }
 
-    fn set_compat(
-        &self,
-        status: &str,
-        reason: Option<&str>,
-        schema: i64,
-        entities: &std::collections::BTreeMap<String, u32>,
-    ) -> Result<()> {
-        self.meta_set("compat_status", status)?;
-        self.meta_set("compat_reason", reason.unwrap_or(""))?;
-        self.meta_set("compat_cloud_schema", &schema.to_string())?;
-        self.meta_set(
-            "compat_entities",
-            &serde_json::to_string(entities).unwrap_or_else(|_| "{}".into()),
-        )?;
-        self.meta_set("compat_checked_at", &crate::fmt::now_rfc3339())?;
+    pub(crate) fn record_incompatible(&self, check: &CompatCheck, reason: &str) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        record_compat_check(&tx, check, Some(reason), false)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn needs_compat_replay(&self, state: &SyncState) -> Result<bool> {
+        Ok((state.cursor > 0 || state.commit_head.unwrap_or(0) > 0)
+            && self.meta_get("compat_history_validated")?.is_none())
     }
 
     /// Refuse to touch the replica when the last sync found a newer cloud
@@ -271,10 +248,11 @@ impl Store {
     pub fn ensure_compatible(&self) -> Result<()> {
         let compat = self.compat()?;
         if compat.checked && !compat.ok {
-            anyhow::bail!(
-                "incompatible Things Cloud version: {} (update things-mcp before using this replica)",
+            return Err(ThingsError::IncompatibleVersion(format!(
+                "{} (update things-mcp before using this replica)",
                 compat.reason.unwrap_or_else(|| "unknown".into())
-            );
+            ))
+            .into());
         }
         Ok(())
     }
@@ -403,25 +381,26 @@ impl Store {
         &mut self,
         history_key: &str,
         generation: i64,
-        schema: i64,
         head: i64,
-        timestamp: &str,
+        check: &CompatCheck,
     ) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_generation(&tx, history_key, generation)?;
-        if meta_i64(&tx, "schema")?.unwrap_or(0) == 0 && schema != 0 {
-            set_meta(&tx, "schema", &schema.to_string())?;
-        }
-        let head = head.max(meta_i64(&tx, "latest_server_index")?.unwrap_or(0));
-        set_meta(&tx, "latest_server_index", &head.to_string())?;
-        set_meta(&tx, "last_sync_at", timestamp)?;
+        record_compat_check(&tx, check, None, false)?;
+        finish_sync_meta(&tx, head, check.schema)?;
         tx.commit()?;
         Ok(())
     }
 
-    pub(crate) fn replace_replica(&mut self, path: &Path, expected: &SyncState) -> Result<()> {
+    pub(crate) fn replace_replica(
+        &mut self,
+        path: &Path,
+        expected: &SyncState,
+        head: i64,
+        check: &CompatCheck,
+    ) -> Result<()> {
         let path = path.to_str().context("staged replica path must be UTF-8")?;
         self.conn.execute("ATTACH DATABASE ?1 AS staged", [path])?;
         let result: Result<()> = (|| {
@@ -432,6 +411,7 @@ impl Store {
                 sync_state(&tx)? == *expected,
                 "replica changed during the rebuild; retry the operation"
             );
+            record_compat_check(&tx, check, None, true)?;
             for table in [
                 "task",
                 "area",
@@ -457,6 +437,7 @@ impl Store {
                 "sync_generation",
                 &(expected.generation + 1).to_string(),
             )?;
+            finish_sync_meta(&tx, head, check.schema)?;
             tx.commit()?;
             Ok(())
         })();
@@ -546,6 +527,106 @@ impl Store {
 }
 
 const CURSOR_KEY: &str = "processed_remote_index";
+
+fn compat(conn: &Connection) -> Result<CompatStatus> {
+    Ok(conn.query_row(
+        "SELECT
+           (SELECT value FROM meta WHERE key = 'compat_status'),
+           (SELECT value FROM meta WHERE key = 'compat_reason'),
+           (SELECT value FROM meta WHERE key = 'compat_cloud_schema'),
+           (SELECT value FROM meta WHERE key = 'compat_entities'),
+           (SELECT value FROM meta WHERE key = 'compat_checked_at')",
+        [],
+        |row| {
+            let status: Option<String> = row.get(0)?;
+            Ok(CompatStatus {
+                checked: status.is_some(),
+                ok: status.as_deref() == Some("ok"),
+                reason: row
+                    .get::<_, Option<String>>(1)?
+                    .filter(|value| !value.is_empty()),
+                cloud_schema: row
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|value| value.parse().ok()),
+                entities: row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default(),
+                checked_at: row.get(4)?,
+            })
+        },
+    )?)
+}
+
+fn record_compat_check(
+    tx: &Transaction<'_>,
+    check: &CompatCheck,
+    reason: Option<&str>,
+    rebuilt: bool,
+) -> Result<()> {
+    let existing = compat(tx)?;
+    let block_revision = meta_i64(tx, "compat_block_revision")?.unwrap_or(0);
+    // A success can clear a block only if it started after the block was
+    // recorded. Any new incompatibility invalidates in-flight successes.
+    if reason.is_none() && check.block_revision != block_revision {
+        if let Some(reason) = existing.reason {
+            return Err(ThingsError::IncompatibleVersion(reason).into());
+        }
+        anyhow::bail!("compatibility changed during sync; retry the operation");
+    }
+
+    let mut entities = if rebuilt {
+        BTreeMap::new()
+    } else {
+        existing.entities
+    };
+    for (base, generation) in &check.entities {
+        entities
+            .entry(base.clone())
+            .and_modify(|current| *current = (*current).max(*generation))
+            .or_insert(*generation);
+    }
+    let schema = if !rebuilt && existing.ok {
+        check.schema.or(existing.cloud_schema)
+    } else {
+        check.schema
+    };
+    let status = if reason.is_some() {
+        "incompatible"
+    } else {
+        "ok"
+    };
+    set_meta(tx, "compat_status", status)?;
+    set_meta(tx, "compat_reason", reason.unwrap_or(""))?;
+    set_meta(
+        tx,
+        "compat_cloud_schema",
+        &schema.map(|schema| schema.to_string()).unwrap_or_default(),
+    )?;
+    set_meta(tx, "compat_entities", &serde_json::to_string(&entities)?)?;
+    set_meta(tx, "compat_checked_at", &crate::fmt::now_rfc3339())?;
+    if reason.is_some() {
+        set_meta(
+            tx,
+            "compat_block_revision",
+            &(block_revision + 1).to_string(),
+        )?;
+    } else {
+        set_meta(tx, "compat_history_validated", "1")?;
+    }
+    Ok(())
+}
+
+fn finish_sync_meta(tx: &Transaction<'_>, head: i64, schema: Option<i64>) -> Result<()> {
+    if let Some(schema) = schema
+        && meta_i64(tx, "schema")?.unwrap_or(0) == 0
+    {
+        set_meta(tx, "schema", &schema.to_string())?;
+    }
+    let head = head.max(meta_i64(tx, "latest_server_index")?.unwrap_or(0));
+    set_meta(tx, "latest_server_index", &head.to_string())?;
+    set_meta(tx, "last_sync_at", &crate::fmt::now_rfc3339())
+}
 
 fn sync_state(conn: &Connection) -> Result<SyncState> {
     Ok(conn.query_row(
