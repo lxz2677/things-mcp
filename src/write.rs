@@ -11,7 +11,7 @@ use crate::fmt;
 use crate::ids;
 use crate::store::Store;
 use crate::sync::SyncEngine;
-use crate::things::encode::{self, TaskDraft, When};
+use crate::things::encode::{self, RepeatSpec, TaskDraft, When};
 use crate::things::{
     ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem, TYPE_HEADING, TYPE_PROJECT,
     ThingsError,
@@ -30,6 +30,8 @@ pub struct TaskPatch {
     pub area: Option<Option<String>>,
     pub heading: Option<Option<String>>,
     pub tags: Option<Vec<String>>,
+    /// `Some(None)` clears the repeat rule.
+    pub repeat: Option<Option<RepeatSpec>>,
 }
 
 impl TaskPatch {
@@ -43,6 +45,7 @@ impl TaskPatch {
             && self.area.is_none()
             && self.heading.is_none()
             && self.tags.is_none()
+            && self.repeat.is_none()
     }
 }
 
@@ -212,6 +215,29 @@ impl WriteService {
             }
             if let Some(tags) = &patch.tags {
                 delta.insert("tg".into(), json!(tags));
+            }
+            if let Some(repeat) = &patch.repeat {
+                match repeat {
+                    Some(spec) => {
+                        let start = patch
+                            .when
+                            .as_ref()
+                            .and_then(|when| when.day(fmt::today_epoch_day()))
+                            .or(existing.start_date)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "task has no start date; pass `when` together with the repeat rule"
+                                )
+                            })?;
+                        let rule = spec.build(start)?;
+                        delta.insert("rr".into(), rule.clone());
+                        delta.insert("rp".into(), rule);
+                    }
+                    None => {
+                        delta.insert("rr".into(), Value::Null);
+                        delta.insert("rp".into(), Value::Null);
+                    }
+                }
             }
 
             if delta.is_empty() {
@@ -961,6 +987,127 @@ mod tests {
         let task = live_store(&service).get_task("task-1").unwrap().unwrap();
         assert_eq!(task.reminder_time, None);
         assert_eq!(task.raw["rmd"], 1_800_090_000);
+    }
+
+    fn weekly_spec() -> crate::things::RepeatSpec {
+        crate::things::RepeatSpec {
+            repeat_type: crate::things::RepeatType::Scheduled,
+            frequency: crate::things::Frequency::Weekly,
+            interval: 1,
+            weekdays: vec!["mon".into(), "wed".into()],
+            day: None,
+            month: None,
+            end_date: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_with_repeat_sends_rr_and_rp() {
+        use crate::things::encode;
+
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(fake.clone(), vec![]));
+        let start = encode::parse_day("2026-11-09").unwrap();
+
+        let mut draft = TaskDraft::new("weekly report");
+        draft.when = When::Date(start);
+        draft.repeater = Some(weekly_spec().build(start).unwrap());
+
+        let outcome = service.create_task(draft).await.unwrap();
+        let payload = last_commit_payload(&fake, &outcome.id);
+        assert_eq!(payload["rr"], payload["rp"], "rr and rp must be identical");
+        assert_eq!(payload["rr"]["fu"], 256);
+        assert_eq!(payload["rr"]["ia"], crate::fmt::day_to_wire(start));
+        assert_eq!(payload["rr"]["of"], json!([{"wd": 1}, {"wd": 3}]));
+
+        let task = live_store(&service).get_task(&outcome.id).unwrap().unwrap();
+        let stored: Value = serde_json::from_str(task.recurrence_rule.as_deref().unwrap()).unwrap();
+        assert_eq!(stored["fu"], 256);
+    }
+
+    #[tokio::test]
+    async fn update_repeat_sends_rr_rp_and_md() {
+        use crate::things::encode;
+
+        let fake = fake_ok(1);
+        let day = encode::parse_day("2026-11-09").unwrap();
+        let mut item = task_item("task-1", "t", vec![]);
+        item.props.insert("sr".into(), json!(fmt::day_to_wire(day)));
+        item.props.insert("st".into(), json!(2));
+        let mut service = WriteService::live(engine_with(fake.clone(), vec![item]));
+
+        let patch = TaskPatch {
+            repeat: Some(Some(weekly_spec())),
+            ..Default::default()
+        };
+        service.update_task("task-1", patch).await.unwrap();
+
+        let payload = last_commit_payload(&fake, "task-1");
+        assert_eq!(payload["rr"], payload["rp"]);
+        assert_eq!(payload["rr"]["fu"], 256);
+        assert!(payload["md"].is_number());
+        assert_eq!(payload.as_object().unwrap().len(), 3);
+        assert!(
+            live_store(&service)
+                .get_task("task-1")
+                .unwrap()
+                .unwrap()
+                .recurrence_rule
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_repeat_sends_null_rules() {
+        use crate::things::encode;
+
+        let fake = fake_ok(1);
+        let day = encode::parse_day("2026-11-09").unwrap();
+        let mut item = task_item("task-1", "t", vec![]);
+        item.props.insert("sr".into(), json!(fmt::day_to_wire(day)));
+        item.props.insert("st".into(), json!(2));
+        item.props
+            .insert("rr".into(), weekly_spec().build(day).unwrap());
+        let mut service = WriteService::live(engine_with(fake.clone(), vec![item]));
+
+        let patch = TaskPatch {
+            repeat: Some(None),
+            ..Default::default()
+        };
+        service.update_task("task-1", patch).await.unwrap();
+
+        let payload = last_commit_payload(&fake, "task-1");
+        assert!(payload["rr"].is_null());
+        assert!(payload["rp"].is_null());
+        assert!(
+            live_store(&service)
+                .get_task("task-1")
+                .unwrap()
+                .unwrap()
+                .recurrence_rule
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_requires_a_start_date_on_update() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![task_item("task-1", "t", vec![])],
+        ));
+
+        let patch = TaskPatch {
+            repeat: Some(Some(weekly_spec())),
+            ..Default::default()
+        };
+        let error = service.update_task("task-1", patch).await.unwrap_err();
+        assert!(error.to_string().contains("start date"), "{error}");
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|request| !request.url.contains("/commit"))
+        );
     }
 
     #[tokio::test]

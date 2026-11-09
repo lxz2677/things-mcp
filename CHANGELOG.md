@@ -9,6 +9,10 @@ Add each release under a `## vX.Y.Z` heading. The release workflow uses that sec
 - `verify`, `doctor`, and `sync_status` show the compatibility state and the last check time; `doctor` adds a `compat.status` audit check.
 - Incompatibility is returned to MCP clients as a tool result (`isError: true`) with a structured `INCOMPATIBLE_VERSION` payload and remediation text, so agents can read the reason and stop instead of relying on a JSON-RPC error.
 
+## Unreleased
+
+- Create and update repeating tasks: daily/weekly/monthly/yearly, every N periods, weekday sets, an optional end date, and after-completion repeats. `create_task` / `update_task` take `repeat`; `update_task` takes `clear_repeat`; the CLI uses `--repeat`, `--repeat-interval`, `--repeat-end`, and `--clear-repeat`. Rules are validated before pushing and written to both `rr` and `rp`.
+
 ## v0.2.1
 
 - Set a local reminder time (`HH:MM`) when creating or updating a task or project with a start date. Use `--remind` in the CLI or `reminder` in MCP. For example, create a task with `--when tomorrow --remind 09:00`.

@@ -10,6 +10,8 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{Datelike, NaiveDate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::fmt;
@@ -58,6 +60,15 @@ impl When {
                     .with_context(|| format!("invalid `when` value `{other}` (expected inbox|today|tomorrow|anytime|someday|evening|YYYY-MM-DD)"))?;
                 Ok(Self::Date(date.num_days_from_ce() as i64 - UNIX_EPOCH_CE))
             }
+        }
+    }
+
+    /// The concrete calendar day for this `when`, if it has one.
+    pub fn day(&self, today: i64) -> Option<i64> {
+        match self {
+            Self::Today | Self::Evening => Some(today),
+            Self::Date(day) => Some(*day),
+            Self::Inbox | Self::Anytime | Self::Someday => None,
         }
     }
 
@@ -157,6 +168,372 @@ pub fn parse_day(value: &str) -> Result<i64> {
     let date = NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
         .with_context(|| format!("invalid date `{value}` (expected YYYY-MM-DD)"))?;
     Ok(date.num_days_from_ce() as i64 - UNIX_EPOCH_CE)
+}
+
+// ---------------------------------------------------------------- repeating
+
+/// `ed` sentinel for "never ends" (4001-01-01).
+const NEVER_ENDS: i64 = 64_092_211_200;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatType {
+    #[default]
+    Scheduled,
+    AfterCompletion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Frequency {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+fn default_interval() -> u32 {
+    1
+}
+
+/// User-facing recurrence description, mapped to the wire `rr`/`rp` object.
+#[derive(Debug, Clone, serde::Serialize, Deserialize, JsonSchema)]
+pub struct RepeatSpec {
+    #[serde(rename = "type", default)]
+    pub repeat_type: RepeatType,
+    pub frequency: Frequency,
+    /// Every N days/weeks/months/years (wire `fa`, default 1).
+    #[serde(default = "default_interval")]
+    pub interval: u32,
+    /// Weekly: `mon`, `wed`, ... (defaults to the start day's weekday).
+    #[serde(default)]
+    pub weekdays: Vec<String>,
+    /// Monthly / yearly day: 1-31, or -1 for the last day of the month.
+    pub day: Option<i32>,
+    /// Yearly month: 1-12.
+    pub month: Option<u32>,
+    /// `YYYY-MM-DD`; omitted means the rule never ends.
+    pub end_date: Option<String>,
+}
+
+impl RepeatSpec {
+    /// Build the wire rule object for a task starting at `start_day`.
+    pub fn build(&self, start_day: i64) -> Result<Value> {
+        if !(1..=999).contains(&self.interval) {
+            bail!("repeat interval must be between 1 and 999");
+        }
+        let start = fmt::epoch_day_to_date(start_day).context("invalid repeat start day")?;
+
+        let (fu, of, first_day) = match self.frequency {
+            Frequency::Daily => (16, json!([{"dy": 0}]), start_day),
+            Frequency::Weekly => {
+                let mut weekdays = if self.weekdays.is_empty() {
+                    vec![weekday_number(start.weekday())]
+                } else {
+                    self.weekdays
+                        .iter()
+                        .map(|name| parse_weekday(name))
+                        .collect::<Result<Vec<_>>>()?
+                };
+                weekdays.sort_unstable();
+                weekdays.dedup();
+                let first = first_weekly(start, &weekdays);
+                let offsets: Vec<Value> = weekdays.iter().map(|wd| json!({"wd": wd})).collect();
+                (256, Value::Array(offsets), first)
+            }
+            Frequency::Monthly => {
+                let day = self.day.unwrap_or(start.day() as i32);
+                if day == 0 || day < -1 || day > 31 {
+                    bail!("monthly repeat day must be 1-31 or -1 (got {day})");
+                }
+                let first = first_monthly(start, day)?;
+                (8, json!([{"dy": wire_day(day)}]), first)
+            }
+            Frequency::Yearly => {
+                let month = self.month.unwrap_or(start.month());
+                let day = self.day.unwrap_or(start.day() as i32);
+                if !(1..=12).contains(&month) {
+                    bail!("yearly repeat month must be 1-12 (got {month})");
+                }
+                if day == 0 || day < -1 || day > 31 {
+                    bail!("yearly repeat day must be 1-31 or -1 (got {day})");
+                }
+                let first = first_yearly(start, month, day)?;
+                (4, json!([{"mo": month - 1, "dy": wire_day(day)}]), first)
+            }
+        };
+
+        let end = match &self.end_date {
+            Some(value) => fmt::day_to_wire(parse_day(value)?),
+            None => NEVER_ENDS,
+        };
+        let (tp, ia, of) = match self.repeat_type {
+            RepeatType::Scheduled => (0, fmt::day_to_wire(first_day), of),
+            // Completed-based repeats have no fixed first occurrence.
+            RepeatType::AfterCompletion => (1, 0, json!([])),
+        };
+
+        let rule = json!({
+            "ia": ia,
+            "rrv": 4,
+            "fu": fu,
+            "ts": 0,
+            "sr": fmt::day_to_wire(start_day),
+            "rc": 0,
+            "fa": self.interval,
+            "tp": tp,
+            "of": of,
+            "ed": end,
+        });
+        validate_repeater(&rule)?;
+        Ok(rule)
+    }
+
+    /// Parse a compact CLI spec:
+    /// `daily`, `weekly`, `weekly:mon,wed`, `monthly:15`, `monthly:last`,
+    /// `yearly:12-25`, optionally prefixed with `after-completion:`.
+    pub fn parse(spec: &str, interval: u32, end_date: Option<String>) -> Result<Self> {
+        let spec = spec.trim().to_ascii_lowercase();
+        let (repeat_type, spec) = match spec.strip_prefix("after-completion:") {
+            Some(rest) => (RepeatType::AfterCompletion, rest),
+            None => (RepeatType::Scheduled, spec.as_str()),
+        };
+        let (frequency, detail) = match spec.split_once(':') {
+            Some((frequency, detail)) => (frequency, Some(detail)),
+            None => (spec, None),
+        };
+
+        let mut parsed = Self {
+            repeat_type,
+            frequency: Frequency::Daily,
+            interval,
+            weekdays: Vec::new(),
+            day: None,
+            month: None,
+            end_date,
+        };
+
+        match frequency {
+            "daily" | "every-day" => parsed.frequency = Frequency::Daily,
+            "weekly" | "every-week" => {
+                parsed.frequency = Frequency::Weekly;
+                if let Some(detail) = detail {
+                    if detail.trim().is_empty() {
+                        bail!("weekly repeat needs at least one weekday");
+                    }
+                    parsed.weekdays = detail
+                        .split(',')
+                        .map(|name| name.trim().to_string())
+                        .collect();
+                }
+            }
+            "monthly" => {
+                parsed.frequency = Frequency::Monthly;
+                if let Some(detail) = detail {
+                    parsed.day = Some(if detail == "last" {
+                        -1
+                    } else {
+                        detail
+                            .parse()
+                            .with_context(|| format!("invalid monthly day `{detail}`"))?
+                    });
+                }
+            }
+            "yearly" => {
+                parsed.frequency = Frequency::Yearly;
+                let detail = detail.context("yearly repeat requires `yearly:MONTH-DAY`")?;
+                let (month, day) = detail
+                    .split_once('-')
+                    .context("yearly repeat requires `yearly:MONTH-DAY`")?;
+                parsed.month = Some(
+                    month
+                        .parse()
+                        .with_context(|| format!("invalid yearly month `{month}`"))?,
+                );
+                parsed.day = Some(if day == "last" {
+                    -1
+                } else {
+                    day.parse()
+                        .with_context(|| format!("invalid yearly day `{day}`"))?
+                });
+            }
+            other => bail!("unsupported repeat `{other}` (expected daily|weekly|monthly|yearly)"),
+        }
+        Ok(parsed)
+    }
+
+    /// First calendar day matching the rule, on or after `from_day`.
+    pub fn first_occurrence(&self, from_day: i64) -> Result<i64> {
+        let from = fmt::epoch_day_to_date(from_day).context("invalid repeat start day")?;
+        let day = match self.frequency {
+            Frequency::Daily => from_day,
+            Frequency::Weekly => {
+                let weekdays = if self.weekdays.is_empty() {
+                    vec![weekday_number(from.weekday())]
+                } else {
+                    self.weekdays
+                        .iter()
+                        .map(|name| parse_weekday(name))
+                        .collect::<Result<Vec<_>>>()?
+                };
+                first_weekly(from, &weekdays)
+            }
+            Frequency::Monthly => first_monthly(from, self.day.unwrap_or(from.day() as i32))?,
+            Frequency::Yearly => first_yearly(
+                from,
+                self.month.unwrap_or(from.month()),
+                self.day.unwrap_or(from.day() as i32),
+            )?,
+        };
+        Ok(day)
+    }
+}
+
+/// Ensure a repeating task has a concrete start day, adjusting `when` if needed.
+pub fn prepare_repeat(when: &mut When, spec: &RepeatSpec, today: i64) -> Result<i64> {
+    // After-completion repeats start with the task itself, so an undated task
+    // starts today. Scheduled repeats jump to their first matching occurrence.
+    if spec.repeat_type == RepeatType::AfterCompletion {
+        return match when {
+            When::Today | When::Evening => Ok(today),
+            When::Date(day) => Ok(*day),
+            _ => {
+                *when = When::Date(today);
+                Ok(today)
+            }
+        };
+    }
+
+    match when {
+        When::Today | When::Evening => Ok(today),
+        When::Date(day) => Ok(*day),
+        _ => {
+            let first = spec.first_occurrence(today)?;
+            *when = When::Date(first);
+            Ok(first)
+        }
+    }
+}
+
+fn parse_weekday(name: &str) -> Result<u32> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "sun" | "sunday" => Ok(0),
+        "mon" | "monday" => Ok(1),
+        "tue" | "tues" | "tuesday" => Ok(2),
+        "wed" | "wednesday" => Ok(3),
+        "thu" | "thur" | "thurs" | "thursday" => Ok(4),
+        "fri" | "friday" => Ok(5),
+        "sat" | "saturday" => Ok(6),
+        other => bail!("invalid weekday `{other}` (expected sun..sat)"),
+    }
+}
+
+fn weekday_number(weekday: chrono::Weekday) -> u32 {
+    weekday.num_days_from_sunday()
+}
+
+fn wire_day(day: i32) -> i32 {
+    if day == -1 { -1 } else { day - 1 }
+}
+
+fn epoch_day(date: NaiveDate) -> i64 {
+    date.num_days_from_ce() as i64 - 719_163
+}
+
+fn first_weekly(start: NaiveDate, weekdays: &[u32]) -> i64 {
+    let current = weekday_number(start.weekday());
+    let delta = weekdays
+        .iter()
+        .map(|wd| (wd + 7 - current) % 7)
+        .min()
+        .unwrap_or(0);
+    epoch_day(start + chrono::Duration::days(delta as i64))
+}
+
+fn add_months(year: i32, month: u32, offset: i32) -> (i32, u32) {
+    let total = year * 12 + (month as i32 - 1) + offset;
+    (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
+}
+
+fn last_day_of_month(year: i32, month: u32) -> Option<NaiveDate> {
+    let (next_year, next_month) = add_months(year, month, 1);
+    NaiveDate::from_ymd_opt(next_year, next_month, 1).map(|date| date - chrono::Duration::days(1))
+}
+
+fn first_monthly(start: NaiveDate, day: i32) -> Result<i64> {
+    for offset in 0..=24 {
+        let (year, month) = add_months(start.year(), start.month(), offset);
+        let candidate = if day == -1 {
+            last_day_of_month(year, month)
+        } else {
+            NaiveDate::from_ymd_opt(year, month, day as u32)
+        };
+        if let Some(date) = candidate
+            && date >= start
+        {
+            return Ok(epoch_day(date));
+        }
+    }
+    bail!("could not compute the first monthly occurrence")
+}
+
+fn first_yearly(start: NaiveDate, month: u32, day: i32) -> Result<i64> {
+    for offset in 0..=8 {
+        let year = start.year() + offset;
+        let candidate = if day == -1 {
+            last_day_of_month(year, month)
+        } else {
+            NaiveDate::from_ymd_opt(year, month, day as u32)
+        };
+        if let Some(date) = candidate
+            && date >= start
+        {
+            return Ok(epoch_day(date));
+        }
+    }
+    bail!("could not compute the first yearly occurrence")
+}
+
+/// Validate a wire `rr`/`rp` object before it can be pushed.
+pub fn validate_repeater(rule: &Value) -> Result<()> {
+    let obj = rule.as_object().context("repeater must be an object")?;
+    for key in ["ia", "rrv", "fu", "ts", "sr", "rc", "fa", "tp", "of", "ed"] {
+        if !obj.contains_key(key) {
+            bail!("repeater is missing `{key}`");
+        }
+    }
+    for key in ["ia", "rrv", "fu", "ts", "sr", "rc", "fa", "tp", "ed"] {
+        if obj[key].as_i64().is_none() {
+            bail!("repeater `{key}` must be an integer");
+        }
+    }
+    if obj["rrv"].as_i64() != Some(4) {
+        bail!("unsupported repeater version (expected rrv=4)");
+    }
+    if !matches!(obj["fu"].as_i64(), Some(4 | 8 | 16 | 256)) {
+        bail!("unsupported repeater frequency unit `{}`", obj["fu"]);
+    }
+    if !matches!(obj["tp"].as_i64(), Some(0 | 1)) {
+        bail!("repeater type must be 0 (scheduled) or 1 (after completion)");
+    }
+    let amplitude = obj["fa"].as_i64().unwrap_or(0);
+    if !(1..=999).contains(&amplitude) {
+        bail!("repeater interval must be between 1 and 999");
+    }
+    let offsets = obj["of"]
+        .as_array()
+        .context("repeater `of` must be an array")?;
+    for offset in offsets {
+        let offset = offset
+            .as_object()
+            .context("repeater offsets must be objects")?;
+        for key in offset.keys() {
+            if !matches!(key.as_str(), "dy" | "wd" | "mo" | "wdo") {
+                bail!("unsupported repeater offset key `{key}`");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `nt`: full-text note object with the CRC32 checksum of the UTF-8 bytes.
@@ -521,6 +898,169 @@ mod tests {
             assert!(obj.contains_key(key), "missing {key}");
         }
         validate_task_create(&payload).expect("payload must pass the safety gate");
+    }
+
+    #[test]
+    fn repeat_rules_match_the_wire_format() {
+        let start = parse_day("2026-11-08").unwrap(); // Sunday
+        let s = fmt::day_to_wire(start);
+
+        let daily = RepeatSpec {
+            repeat_type: RepeatType::Scheduled,
+            frequency: Frequency::Daily,
+            interval: 1,
+            weekdays: Vec::new(),
+            day: None,
+            month: None,
+            end_date: None,
+        }
+        .build(start)
+        .unwrap();
+        assert_eq!(daily["fu"], 16);
+        assert_eq!(daily["tp"], 0);
+        assert_eq!(daily["sr"], s);
+        assert_eq!(daily["ia"], s);
+        assert_eq!(daily["fa"], 1);
+        assert_eq!(daily["of"], json!([{"dy": 0}]));
+        assert_eq!(daily["ed"], 64_092_211_200i64);
+
+        let weekly = RepeatSpec {
+            frequency: Frequency::Weekly,
+            weekdays: vec!["mon".into(), "wed".into()],
+            ..daily_spec()
+        }
+        .build(start)
+        .unwrap();
+        assert_eq!(weekly["fu"], 256);
+        assert_eq!(weekly["of"], json!([{"wd": 1}, {"wd": 3}]));
+        assert_eq!(weekly["ia"], fmt::day_to_wire(start + 1)); // next Monday
+
+        let monthly = RepeatSpec {
+            frequency: Frequency::Monthly,
+            day: Some(15),
+            ..daily_spec()
+        }
+        .build(start)
+        .unwrap();
+        assert_eq!(monthly["fu"], 8);
+        assert_eq!(monthly["of"], json!([{"dy": 14}]));
+        assert_eq!(monthly["ia"], fmt::day_to_wire(start + 7));
+
+        let last = RepeatSpec {
+            frequency: Frequency::Monthly,
+            day: Some(-1),
+            ..daily_spec()
+        }
+        .build(start)
+        .unwrap();
+        assert_eq!(last["of"], json!([{"dy": -1}]));
+        assert_eq!(last["ia"], fmt::day_to_wire(start + 22)); // 2026-11-30
+
+        let yearly = RepeatSpec {
+            frequency: Frequency::Yearly,
+            month: Some(12),
+            day: Some(25),
+            ..daily_spec()
+        }
+        .build(start)
+        .unwrap();
+        assert_eq!(yearly["fu"], 4);
+        assert_eq!(yearly["of"], json!([{"mo": 11, "dy": 24}]));
+        assert_eq!(
+            yearly["ia"],
+            fmt::day_to_wire(parse_day("2026-12-25").unwrap())
+        );
+
+        let after = RepeatSpec {
+            repeat_type: RepeatType::AfterCompletion,
+            frequency: Frequency::Weekly,
+            interval: 2,
+            end_date: Some("2027-01-01".into()),
+            ..daily_spec()
+        }
+        .build(start)
+        .unwrap();
+        assert_eq!(after["tp"], 1);
+        assert_eq!(after["ia"], 0);
+        assert_eq!(after["of"], json!([]));
+        assert_eq!(after["fa"], 2);
+        assert_eq!(
+            after["ed"],
+            fmt::day_to_wire(parse_day("2027-01-01").unwrap())
+        );
+    }
+
+    #[test]
+    fn repeat_spec_parses_compact_cli_syntax() {
+        let spec = RepeatSpec::parse("weekly:mon,wed", 1, None).unwrap();
+        assert_eq!(spec.frequency, Frequency::Weekly);
+        assert_eq!(spec.weekdays, vec!["mon", "wed"]);
+
+        let spec = RepeatSpec::parse("after-completion:daily", 3, None).unwrap();
+        assert_eq!(spec.repeat_type, RepeatType::AfterCompletion);
+        assert_eq!(spec.interval, 3);
+
+        let spec = RepeatSpec::parse("monthly:last", 1, None).unwrap();
+        assert_eq!(spec.day, Some(-1));
+
+        let spec = RepeatSpec::parse("yearly:12-25", 1, None).unwrap();
+        assert_eq!(spec.month, Some(12));
+        assert_eq!(spec.day, Some(25));
+
+        assert!(RepeatSpec::parse("weekly", 1, None).is_ok());
+        assert!(RepeatSpec::parse("yearly", 1, None).is_err());
+        assert!(RepeatSpec::parse("hourly", 1, None).is_err());
+    }
+
+    #[test]
+    fn after_completion_repeat_starts_today() {
+        let mut when = When::Someday;
+        let spec = RepeatSpec {
+            repeat_type: RepeatType::AfterCompletion,
+            frequency: Frequency::Weekly,
+            interval: 2,
+            weekdays: vec!["mon".into()],
+            day: None,
+            month: None,
+            end_date: None,
+        };
+        let start = prepare_repeat(&mut when, &spec, 20765).unwrap();
+        assert_eq!(start, 20765);
+        assert_eq!(when, When::Date(20765));
+
+        let rule = spec.build(start).unwrap();
+        assert_eq!(rule["tp"], 1);
+        assert_eq!(rule["ia"], 0);
+    }
+
+    #[test]
+    fn repeat_validation_rejects_bad_rules() {
+        let mut rule = RepeatSpec {
+            frequency: Frequency::Daily,
+            ..daily_spec()
+        }
+        .build(20765)
+        .unwrap();
+        validate_repeater(&rule).unwrap();
+
+        rule["fu"] = json!(32);
+        assert!(validate_repeater(&rule).is_err());
+
+        rule["fu"] = json!(16);
+        rule["fa"] = json!(0);
+        assert!(validate_repeater(&rule).is_err());
+    }
+
+    fn daily_spec() -> RepeatSpec {
+        RepeatSpec {
+            repeat_type: RepeatType::Scheduled,
+            frequency: Frequency::Daily,
+            interval: 1,
+            weekdays: Vec::new(),
+            day: None,
+            month: None,
+            end_date: None,
+        }
     }
 
     #[test]

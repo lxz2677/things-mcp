@@ -26,8 +26,8 @@ use crate::store::{
 };
 use crate::sync::{SyncEngine, SyncReport};
 use crate::things::{
-    ClientOptions, HttpTransport, SUPPORTED_SCHEMA, TaskDraft, ThingsClient, ThingsError, When,
-    parse_day, parse_reminder,
+    ClientOptions, HttpTransport, RepeatSpec, SUPPORTED_SCHEMA, TaskDraft, ThingsClient,
+    ThingsError, When, parse_day, parse_reminder, prepare_repeat,
 };
 use crate::write::{TaskPatch, WriteService};
 
@@ -73,6 +73,7 @@ pub const DIAGNOSTIC_TARGET: &str = "things_mcp_diagnostics";
 const INSTRUCTIONS: &str = "\
 Read tools use a local SQLite replica that is refreshed lazily. Call `sync_now` to force a pull.\n\
 Write tools commit directly to Things Cloud by default. Set dry_run=true to preview the payload.\n\
+Repeating tasks: repeat={frequency: daily|weekly|monthly|yearly, interval?, weekdays?, day?, month?, end_date?, type?: scheduled|after_completion}.\n\
 Lists: inbox, today, upcoming, anytime, someday, logbook, deadlines, repeating, \
 trash, all, project-<id>, area-<id>, tag-<id>.\n\
 Task ids are base58 strings. Dates are YYYY-MM-DD, timestamps RFC-3339.";
@@ -359,6 +360,9 @@ pub struct CreateTaskArgs {
     pub tags: Option<Vec<String>>,
     /// Reminder time in local time, `HH:MM`. Requires a dated `when`.
     pub reminder: Option<String>,
+    /// Recurrence rule. Dated `when` values are used as the rule start; an
+    /// undated task is scheduled on the first matching occurrence.
+    pub repeat: Option<RepeatSpec>,
     /// Preview the exact wire payload without writing (default false).
     pub dry_run: Option<bool>,
 }
@@ -375,6 +379,8 @@ pub struct CreateProjectArgs {
     pub tags: Option<Vec<String>>,
     /// Reminder time in local time, `HH:MM`. Requires a dated `when`.
     pub reminder: Option<String>,
+    /// Recurrence rule.
+    pub repeat: Option<RepeatSpec>,
     pub dry_run: Option<bool>,
 }
 
@@ -437,6 +443,9 @@ pub struct UpdateTaskArgs {
     /// Reminder time in local time, `HH:MM`. The item needs a start date.
     pub reminder: Option<String>,
     pub clear_reminder: Option<bool>,
+    /// Recurrence rule; requires a dated task or `when` in the same call.
+    pub repeat: Option<RepeatSpec>,
+    pub clear_repeat: Option<bool>,
     pub dry_run: Option<bool>,
 }
 
@@ -510,6 +519,7 @@ fn draft_from(
     heading: Option<String>,
     tags: Option<Vec<String>>,
     reminder: Option<String>,
+    repeat: Option<RepeatSpec>,
     task_type: i64,
 ) -> Result<TaskDraft, McpError> {
     let mut draft = TaskDraft::new(title);
@@ -531,6 +541,11 @@ fn draft_from(
         .map(parse_reminder)
         .transpose()
         .map_err(invalid_param)?;
+    if let Some(spec) = repeat {
+        let start = prepare_repeat(&mut draft.when, &spec, fmt::today_epoch_day())
+            .map_err(invalid_param)?;
+        draft.repeater = Some(spec.build(start).map_err(invalid_param)?);
+    }
     Ok(draft)
 }
 
@@ -807,7 +822,7 @@ impl ThingsServer {
     }
 
     #[tool(
-        description = "Create a task in Things Cloud. Set dry_run=true to preview the 34-key wire payload."
+        description = "Create a task in Things Cloud. `repeat` adds a recurrence rule (daily/weekly/monthly/yearly, interval, weekdays, end date, after-completion); an undated repeat is scheduled on its first occurrence. Set dry_run=true to preview the 34-key wire payload."
     )]
     async fn create_task(
         &self,
@@ -824,6 +839,7 @@ impl ThingsServer {
             args.heading_id,
             args.tags,
             args.reminder,
+            args.repeat,
             0,
         )?;
         let mut service = write_service_or_return!(self, dry_run);
@@ -849,6 +865,7 @@ impl ThingsServer {
             None,
             args.tags,
             args.reminder,
+            args.repeat,
             1,
         )?;
         let mut service = write_service_or_return!(self, dry_run);
@@ -895,7 +912,7 @@ impl ThingsServer {
     }
 
     #[tool(
-        description = "Update a task. Only the provided fields are sent as a minimal delta (plus md)."
+        description = "Update a task. Only the provided fields are sent as a minimal delta (plus md). `repeat` sets a recurrence rule; `clear_repeat` removes it."
     )]
     async fn update_task(
         &self,
@@ -932,6 +949,11 @@ impl ThingsServer {
         } else {
             args.tags
         };
+        let repeat = if args.clear_repeat.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.repeat.map(Some)
+        };
         let reminder_time = if args.clear_reminder.unwrap_or(false) {
             Some(None)
         } else {
@@ -958,6 +980,7 @@ impl ThingsServer {
             heading,
             tags,
             reminder_time,
+            repeat,
         };
 
         let mut service = write_service_or_return!(self, dry_run);

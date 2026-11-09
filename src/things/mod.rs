@@ -10,12 +10,13 @@ pub use client::{
     RawReply, RawRequest, ThingsClient, ThingsError, Transport,
 };
 pub use encode::{
-    AREA_KIND, CHECKLIST_KIND, TAG_KIND, TASK_CREATE_KEYS, TASK_KIND, TaskDraft, When,
-    area_create_payload, cancel_update, checklist_create_payload, complete_update,
-    container_update, deadline_update, delete_envelope, envelope, format_reminder, notes_object,
-    notes_update, parse_day, parse_reminder, reopen_update, tag_create_payload, tags_update,
-    task_create_payload, title_update, trash_update, validate_area_create,
-    validate_checklist_create, validate_tag_create, validate_task_create, when_update,
+    AREA_KIND, CHECKLIST_KIND, Frequency, RepeatSpec, RepeatType, TAG_KIND, TASK_CREATE_KEYS,
+    TASK_KIND, TaskDraft, When, area_create_payload, cancel_update, checklist_create_payload,
+    complete_update, container_update, deadline_update, delete_envelope, envelope, format_reminder,
+    notes_object, notes_update, parse_day, parse_reminder, prepare_repeat, reopen_update,
+    tag_create_payload, tags_update, task_create_payload, title_update, trash_update,
+    validate_area_create, validate_checklist_create, validate_repeater, validate_tag_create,
+    validate_task_create, when_update,
 };
 pub use model::{
     ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, Area, ChecklistItem, EntityKind, START_INBOX,

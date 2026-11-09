@@ -88,7 +88,13 @@ fn stdio_server_lists_and_calls_tools() {
                 "method": "tools/call",
                 "params": {
                     "name": "create_task",
-                    "arguments": {"title": "preview", "when": "tomorrow", "reminder": "09:00", "dry_run": true}
+                    "arguments": {
+                        "title": "preview",
+                        "when": "tomorrow",
+                        "reminder": "09:00",
+                        "repeat": {"frequency": "weekly", "weekdays": ["mon"]},
+                        "dry_run": true
+                    }
                 }
             }),
             json!({
@@ -215,6 +221,12 @@ fn stdio_server_lists_and_calls_tools() {
     );
     assert_eq!(payload["payload"]["tt"], "preview");
     assert_eq!(payload["payload"]["ato"], 32_400);
+    assert_eq!(payload["payload"]["rr"], payload["payload"]["rp"]);
+    assert_eq!(payload["payload"]["rr"]["fu"], 256);
+    assert_eq!(
+        payload["payload"]["st"], 2,
+        "an undated repeat is auto-scheduled"
+    );
     assert!(payload["payload"]["sr"].is_i64());
 
     let area = responses

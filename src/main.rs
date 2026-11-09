@@ -16,7 +16,7 @@ use things_mcp::store::{
     search_tasks, summaries, task_counts, task_detail,
 };
 use things_mcp::sync::SyncEngine;
-use things_mcp::things::{ClientOptions, HttpTransport, TaskDraft, ThingsClient, When};
+use things_mcp::things::{ClientOptions, HttpTransport, RepeatSpec, TaskDraft, ThingsClient, When};
 use things_mcp::write::{TaskPatch, WriteService};
 
 #[derive(Parser, Debug)]
@@ -145,6 +145,14 @@ enum Command {
         /// Reminder time in local time, HH:MM. Requires a dated --when.
         #[arg(long)]
         remind: Option<String>,
+        /// Repeat: daily | weekly[:mon,wed] | monthly:15 | monthly:last |
+        /// yearly:12-25, optionally prefixed with after-completion:
+        #[arg(long)]
+        repeat: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeat_interval: u32,
+        #[arg(long)]
+        repeat_end: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -164,6 +172,13 @@ enum Command {
         /// Reminder time in local time, HH:MM. Requires a dated --when.
         #[arg(long)]
         remind: Option<String>,
+        /// Repeat spec (see `create --help`).
+        #[arg(long)]
+        repeat: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeat_interval: u32,
+        #[arg(long)]
+        repeat_end: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -257,6 +272,15 @@ enum Command {
         remind: Option<String>,
         #[arg(long)]
         clear_remind: bool,
+        /// Repeat spec, or `none` to clear.
+        #[arg(long)]
+        repeat: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeat_interval: u32,
+        #[arg(long)]
+        repeat_end: Option<String>,
+        #[arg(long)]
+        clear_repeat: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -379,8 +403,13 @@ async fn main() -> Result<()> {
             heading,
             tag,
             remind,
+            repeat,
+            repeat_interval,
+            repeat_end,
             dry_run,
         } => {
+            let repeat =
+                parse_repeat_cli(repeat.as_deref(), repeat_interval, repeat_end.as_deref())?;
             write_create(
                 &config,
                 &title,
@@ -392,6 +421,7 @@ async fn main() -> Result<()> {
                 heading,
                 tag,
                 remind.as_deref(),
+                repeat,
                 0,
                 dry_run,
             )
@@ -405,8 +435,13 @@ async fn main() -> Result<()> {
             area,
             tag,
             remind,
+            repeat,
+            repeat_interval,
+            repeat_end,
             dry_run,
         } => {
+            let repeat =
+                parse_repeat_cli(repeat.as_deref(), repeat_interval, repeat_end.as_deref())?;
             write_create(
                 &config,
                 &title,
@@ -418,6 +453,7 @@ async fn main() -> Result<()> {
                 None,
                 tag,
                 remind.as_deref(),
+                repeat,
                 1,
                 dry_run,
             )
@@ -477,8 +513,18 @@ async fn main() -> Result<()> {
             clear_tags,
             remind,
             clear_remind,
+            repeat,
+            repeat_interval,
+            repeat_end,
+            clear_repeat,
             dry_run,
         } => {
+            let repeat = if clear_repeat || repeat.as_deref() == Some("none") {
+                Some(None)
+            } else {
+                parse_repeat_cli(repeat.as_deref(), repeat_interval, repeat_end.as_deref())?
+                    .map(Some)
+            };
             write_update(
                 &config,
                 &id,
@@ -497,6 +543,7 @@ async fn main() -> Result<()> {
                 clear_tags,
                 remind,
                 clear_remind,
+                repeat,
                 dry_run,
             )
             .await
@@ -608,6 +655,7 @@ async fn write_create(
     heading: Option<String>,
     tags: Vec<String>,
     remind: Option<&str>,
+    repeat: Option<RepeatSpec>,
     task_type: i64,
     dry_run: bool,
 ) -> Result<()> {
@@ -621,6 +669,11 @@ async fn write_create(
     draft.heading = heading;
     draft.tags = tags;
     draft.reminder_time = remind.map(things_mcp::things::parse_reminder).transpose()?;
+    if let Some(spec) = repeat {
+        let start =
+            things_mcp::things::prepare_repeat(&mut draft.when, &spec, fmt::today_epoch_day())?;
+        draft.repeater = Some(spec.build(start)?);
+    }
 
     let mut service = write_service(config, dry_run).await?;
     let outcome = service.create_task(draft).await?;
@@ -720,6 +773,7 @@ async fn write_update(
     clear_tags: bool,
     remind: Option<String>,
     clear_remind: bool,
+    repeat: Option<Option<RepeatSpec>>,
     dry_run: bool,
 ) -> Result<()> {
     let deadline = if clear_deadline {
@@ -773,6 +827,7 @@ async fn write_update(
         heading,
         tags,
         reminder_time,
+        repeat,
     };
 
     let mut service = write_service(config, dry_run).await?;
@@ -810,6 +865,21 @@ async fn write_status(
 async fn write_checklist(config: &Config, task: &str, title: &str, dry_run: bool) -> Result<()> {
     let mut service = write_service(config, dry_run).await?;
     print_json(&service.add_checklist_item(task, title).await?)
+}
+
+fn parse_repeat_cli(
+    spec: Option<&str>,
+    interval: u32,
+    end_date: Option<&str>,
+) -> Result<Option<RepeatSpec>> {
+    match spec {
+        None => Ok(None),
+        Some(spec) => Ok(Some(RepeatSpec::parse(
+            spec,
+            interval,
+            end_date.map(ToOwned::to_owned),
+        )?)),
+    }
 }
 
 fn open_store(config: &Config) -> Result<Store> {
