@@ -1,10 +1,12 @@
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use things_mcp::config::Config;
 use things_mcp::fmt;
@@ -295,15 +297,27 @@ enum Command {
         /// Seconds before a read tool triggers a background pull (0 = never).
         #[arg(long, default_value_t = 60, env = "THINGS_REFRESH_SECS")]
         refresh_secs: u64,
+        /// Append MCP diagnostics to this file.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+    let log_file = match &cli.command {
+        Command::Serve { log_file, .. } => log_file.as_deref(),
+        _ => None,
+    };
+    init_tracing(cli.verbose, log_file)?;
 
-    let config = Config::load(cli.email.clone(), cli.base_url.clone(), cli.db.clone())?;
+    let config = Config::load(cli.email.clone(), cli.base_url.clone(), cli.db.clone())
+        .inspect_err(|error| {
+            if log_file.is_some() {
+                tracing::error!(target: things_mcp::mcp::DIAGNOSTIC_TARGET, %error, "MCP configuration failed");
+            }
+        })?;
 
     match cli.command {
         Command::Account { json } => account(&config, json).await,
@@ -491,22 +505,66 @@ async fn main() -> Result<()> {
             title,
             dry_run,
         } => write_checklist(&config, &task, &title, dry_run).await,
-        Command::Serve { refresh_secs } => things_mcp::mcp::run(config, refresh_secs).await,
+        Command::Serve { refresh_secs, .. } => things_mcp::mcp::run(config, refresh_secs).await,
     }
 }
 
-fn init_tracing(verbose: u8) {
+fn init_tracing(verbose: u8, log_file: Option<&Path>) -> Result<()> {
     let default = if verbose > 0 {
         "things_mcp=debug,info"
     } else {
         "things_mcp=info,warn"
     };
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| default.to_string());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(filter))
+    let stderr = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
+        .with_filter(EnvFilter::new(filter));
+    let file = log_file.map(open_mcp_log).transpose()?.map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(file)
+            .with_ansi(false)
+            .with_target(false)
+            .with_filter(EnvFilter::new(format!(
+                "{}=info,rmcp::service=error,rmcp::transport::async_rw=error",
+                things_mcp::mcp::DIAGNOSTIC_TARGET
+            )))
+    });
+    let _ = tracing_subscriber::registry()
+        .with(stderr)
+        .with(file)
         .try_init();
+
+    if log_file.is_some() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            tracing::error!(
+                target: things_mcp::mcp::DIAGNOSTIC_TARGET,
+                pid = std::process::id(),
+                location = ?panic.location(),
+                "MCP process panicked"
+            );
+            previous_hook(panic);
+        }));
+    }
+    Ok(())
+}
+
+fn open_mcp_log(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening MCP log {}", path.display()))?;
+    anyhow::ensure!(file.metadata()?.is_file(), "MCP log must be a regular file");
+    Ok(file)
 }
 
 async fn write_service(config: &Config, dry_run: bool) -> Result<WriteService> {

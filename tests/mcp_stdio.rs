@@ -40,10 +40,13 @@ fn seed(path: &std::path::Path) {
 fn stdio_server_lists_and_calls_tools() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("things.sqlite");
+    let log_file = dir.path().join("mcp.log");
     seed(&db);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_things-mcp"))
         .arg("serve")
+        .arg("--log-file")
+        .arg(&log_file)
         .env("THINGS_DB", &db)
         .env("THINGS_BASE_URL", "http://127.0.0.1:9")
         .env("THINGS_REFRESH_SECS", "0")
@@ -118,7 +121,20 @@ fn stdio_server_lists_and_calls_tools() {
     }
 
     drop(child.stdin.take());
-    let _ = child.wait();
+    assert!(child.wait().unwrap().success());
+
+    let log = std::fs::read_to_string(log_file).unwrap();
+    assert!(log.contains("MCP stdio ready"), "{log}");
+    assert!(
+        log.contains("MCP tool started") && log.contains("tool=list_tasks"),
+        "{log}"
+    );
+    assert!(log.contains("MCP tool finished"), "{log}");
+    assert!(
+        log.contains("MCP stdio stopped") && log.contains("reason=Closed"),
+        "{log}"
+    );
+    assert!(!log.contains("buy milk"), "{log}");
 
     let initialize = responses
         .iter()

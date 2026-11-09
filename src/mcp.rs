@@ -1,10 +1,16 @@
 //! MCP server (stdio transport).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ServerCapabilities,
+    ServerConfig,
+};
+use rmcp::service::{QuitReason, RequestContext};
 use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -26,6 +32,7 @@ use crate::write::{TaskPatch, WriteService};
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
+pub const DIAGNOSTIC_TARGET: &str = "things_mcp_diagnostics";
 const INSTRUCTIONS: &str = "\
 Read tools use a local SQLite replica that is refreshed lazily. Call `sync_now` to force a pull.\n\
 Write tools commit directly to Things Cloud by default. Set dry_run=true to preview the payload.\n\
@@ -41,7 +48,6 @@ struct ServerState {
 
 #[derive(Clone)]
 pub struct ThingsServer {
-    #[allow(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
     state: Arc<ServerState>,
 }
@@ -1072,6 +1078,34 @@ impl rmcp::ServerHandler for ThingsServer {
             .with_server_info(Implementation::new("things-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tool = request.name.clone();
+        let id = context.id.clone();
+        let started = Instant::now();
+        let pid = std::process::id();
+        tracing::info!(target: DIAGNOSTIC_TARGET, pid, %id, %tool, "MCP tool started");
+        let result = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await;
+        let elapsed_ms = started.elapsed().as_millis();
+        match &result {
+            Ok(response) => {
+                let is_error = matches!(response, CallToolResponse::Complete(result) if result.is_error == Some(true));
+                tracing::info!(target: DIAGNOSTIC_TARGET, pid, %id, %tool, elapsed_ms, is_error, "MCP tool finished");
+            }
+            Err(error) => {
+                let kind = error.data.as_ref().and_then(|data| data["code"].as_str());
+                tracing::info!(target: DIAGNOSTIC_TARGET, pid, %id, %tool, elapsed_ms, rpc_code = error.code.0, ?kind, "MCP tool failed");
+            }
+        }
+        result
+    }
 }
 
 fn clamp(limit: usize) -> usize {
@@ -1148,9 +1182,25 @@ fn with_warning(mut payload: Value, warning: Option<String>) -> Value {
 
 /// Run the stdio MCP server until the client disconnects.
 pub async fn run(config: Config, refresh_secs: u64) -> anyhow::Result<()> {
+    let pid = std::process::id();
+    tracing::info!(target: DIAGNOSTIC_TARGET, pid, version = env!("CARGO_PKG_VERSION"), "MCP stdio starting");
     let server = ThingsServer::new(config, refresh_secs);
-    let service = server.serve(rmcp::transport::stdio()).await?;
-    service.waiting().await?;
+    let service = server
+        .serve(rmcp::transport::stdio())
+        .await
+        .inspect_err(|_| {
+            tracing::error!(target: DIAGNOSTIC_TARGET, pid, "MCP stdio handshake failed");
+        })?;
+    tracing::info!(target: DIAGNOSTIC_TARGET, pid, "MCP stdio ready");
+    match service.waiting().await {
+        Ok(QuitReason::JoinError(error)) | Err(error) => {
+            tracing::error!(target: DIAGNOSTIC_TARGET, pid, panic = error.is_panic(), "MCP stdio task failed");
+            return Err(error.into());
+        }
+        Ok(reason) => {
+            tracing::info!(target: DIAGNOSTIC_TARGET, pid, ?reason, "MCP stdio stopped");
+        }
+    }
     Ok(())
 }
 
