@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS task (
   deadline                      INTEGER,
   deadline_suppression_date     INTEGER,
   deadline_offset               INTEGER NOT NULL DEFAULT 0,
+  reminder_time                 INTEGER,
 
   index_value                   INTEGER,
   today_index                   INTEGER,

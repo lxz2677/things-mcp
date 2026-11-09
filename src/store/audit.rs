@@ -15,7 +15,7 @@ pub struct CheckResult {
 }
 
 pub fn audit(conn: &Connection) -> Result<Vec<CheckResult>> {
-    let checks: [(&'static str, &str); 19] = [
+    let checks: [(&'static str, &str); 20] = [
         (
             "decode.title",
             "SELECT id FROM task
@@ -92,6 +92,12 @@ pub fn audit(conn: &Connection) -> Result<Vec<CheckResult>> {
             "SELECT id FROM task
              WHERE json_type(raw, '$.agr') = 'array'
                AND COALESCE(heading, '') != COALESCE(json_extract(raw, '$.agr[0]'), '')",
+        ),
+        (
+            "decode.reminder",
+            "SELECT id FROM task
+             WHERE json_type(raw, '$.ato') IS NOT NULL
+               AND reminder_time IS NOT json_extract(raw, '$.ato')",
         ),
         (
             "decode.notes",

@@ -88,7 +88,7 @@ fn stdio_server_lists_and_calls_tools() {
                 "method": "tools/call",
                 "params": {
                     "name": "create_task",
-                    "arguments": {"title": "preview", "dry_run": true}
+                    "arguments": {"title": "preview", "reminder": "09:00", "dry_run": true}
                 }
             }),
             json!({
@@ -214,6 +214,7 @@ fn stdio_server_lists_and_calls_tools() {
         "dry-run must expose the 34-key snapshot"
     );
     assert_eq!(payload["payload"]["tt"], "preview");
+    assert_eq!(payload["payload"]["ato"], 32_400);
 
     let area = responses
         .iter()

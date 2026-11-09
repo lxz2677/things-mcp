@@ -85,6 +85,8 @@ pub struct Task {
     pub user_modification_date: Option<f64>,
     pub stop_date: Option<f64>,
     pub last_reminder_interaction_date: Option<f64>,
+    /// Reminder time as seconds since local midnight (wire `ato`).
+    pub reminder_time: Option<i64>,
 
     pub start: i64,
     pub start_date: Option<i64>,

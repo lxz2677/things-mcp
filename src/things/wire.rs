@@ -163,6 +163,11 @@ pub fn apply_task(task: &mut Task, props: &Map<String, Value>) {
     if let Some(value) = opt_instant(props, "lai") {
         task.last_reminder_interaction_date = value;
     }
+    // `ato` is the reminder time as seconds since local midnight (the upstream
+    // docs mis-label it as afterCompletionReference; `acrd` is that field).
+    if props.contains_key("ato") {
+        task.reminder_time = props.get("ato").and_then(int);
+    }
 
     if let Some(value) = opt_day(props, "sr") {
         task.start_date = value;
@@ -335,6 +340,16 @@ mod tests {
         assert!(task.start_date.is_some());
         apply_task(&mut task, &props(json!({"sr": null})));
         assert_eq!(task.start_date, None);
+    }
+
+    #[test]
+    fn decodes_and_clears_reminder_time() {
+        let mut task = Task::default();
+        apply_task(&mut task, &props(json!({"ato": 56700})));
+        assert_eq!(task.reminder_time, Some(56_700));
+
+        apply_task(&mut task, &props(json!({"ato": null})));
+        assert_eq!(task.reminder_time, None);
     }
 
     #[test]

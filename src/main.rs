@@ -142,6 +142,9 @@ enum Command {
         heading: Option<String>,
         #[arg(long = "tag")]
         tag: Vec<String>,
+        /// Reminder time in local time, HH:MM.
+        #[arg(long)]
+        remind: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -158,6 +161,9 @@ enum Command {
         area: Option<String>,
         #[arg(long = "tag")]
         tag: Vec<String>,
+        /// Reminder time in local time, HH:MM.
+        #[arg(long)]
+        remind: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -246,6 +252,11 @@ enum Command {
         tags: Vec<String>,
         #[arg(long)]
         clear_tags: bool,
+        /// Reminder time in local time, HH:MM.
+        #[arg(long)]
+        remind: Option<String>,
+        #[arg(long)]
+        clear_remind: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -367,6 +378,7 @@ async fn main() -> Result<()> {
             area,
             heading,
             tag,
+            remind,
             dry_run,
         } => {
             write_create(
@@ -379,6 +391,7 @@ async fn main() -> Result<()> {
                 area,
                 heading,
                 tag,
+                remind.as_deref(),
                 0,
                 dry_run,
             )
@@ -391,6 +404,7 @@ async fn main() -> Result<()> {
             deadline,
             area,
             tag,
+            remind,
             dry_run,
         } => {
             write_create(
@@ -403,6 +417,7 @@ async fn main() -> Result<()> {
                 area,
                 None,
                 tag,
+                remind.as_deref(),
                 1,
                 dry_run,
             )
@@ -460,6 +475,8 @@ async fn main() -> Result<()> {
             clear_heading,
             tags,
             clear_tags,
+            remind,
+            clear_remind,
             dry_run,
         } => {
             write_update(
@@ -478,6 +495,8 @@ async fn main() -> Result<()> {
                 clear_heading,
                 tags,
                 clear_tags,
+                remind,
+                clear_remind,
                 dry_run,
             )
             .await
@@ -588,6 +607,7 @@ async fn write_create(
     area: Option<String>,
     heading: Option<String>,
     tags: Vec<String>,
+    remind: Option<&str>,
     task_type: i64,
     dry_run: bool,
 ) -> Result<()> {
@@ -600,6 +620,7 @@ async fn write_create(
     draft.area = area;
     draft.heading = heading;
     draft.tags = tags;
+    draft.reminder_time = remind.map(things_mcp::things::parse_reminder).transpose()?;
 
     let mut service = write_service(config, dry_run).await?;
     let outcome = service.create_task(draft).await?;
@@ -697,6 +718,8 @@ async fn write_update(
     clear_heading: bool,
     tags: Vec<String>,
     clear_tags: bool,
+    remind: Option<String>,
+    clear_remind: bool,
     dry_run: bool,
 ) -> Result<()> {
     let deadline = if clear_deadline {
@@ -730,6 +753,15 @@ async fn write_update(
     } else {
         Some(tags)
     };
+    let reminder_time = if clear_remind {
+        Some(None)
+    } else {
+        remind
+            .as_deref()
+            .map(things_mcp::things::parse_reminder)
+            .transpose()?
+            .map(Some)
+    };
 
     let patch = TaskPatch {
         title,
@@ -740,6 +772,7 @@ async fn write_update(
         area,
         heading,
         tags,
+        reminder_time,
     };
 
     let mut service = write_service(config, dry_run).await?;

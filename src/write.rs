@@ -24,6 +24,8 @@ pub struct TaskPatch {
     pub when: Option<When>,
     /// `Some(None)` clears the deadline.
     pub deadline: Option<Option<i64>>,
+    /// Reminder time as seconds since local midnight; `Some(None)` clears it.
+    pub reminder_time: Option<Option<i64>>,
     pub project: Option<Option<String>>,
     pub area: Option<Option<String>>,
     pub heading: Option<Option<String>>,
@@ -36,6 +38,7 @@ impl TaskPatch {
             && self.notes.is_none()
             && self.when.is_none()
             && self.deadline.is_none()
+            && self.reminder_time.is_none()
             && self.project.is_none()
             && self.area.is_none()
             && self.heading.is_none()
@@ -175,6 +178,9 @@ impl WriteService {
             }
             if let Some(deadline) = patch.deadline {
                 delta.insert("dd".into(), json!(deadline.map(fmt::day_to_wire)));
+            }
+            if let Some(reminder) = patch.reminder_time {
+                delta.insert("ato".into(), json!(reminder));
             }
             if let Some(project) = &patch.project {
                 delta.insert("pr".into(), json!(project.as_slice()));
@@ -867,6 +873,75 @@ mod tests {
                 .get_task(&outcome.id)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_reminder_sends_ato() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(fake.clone(), vec![]));
+
+        let mut draft = TaskDraft::new("remind me");
+        draft.when = When::Anytime;
+        draft.reminder_time = Some(encode::parse_reminder("09:00").unwrap());
+
+        let outcome = service.create_task(draft).await.unwrap();
+        assert_eq!(outcome.payload["ato"], 32_400);
+
+        let task = live_store(&service).get_task(&outcome.id).unwrap().unwrap();
+        assert_eq!(task.reminder_time, Some(32_400));
+    }
+
+    #[tokio::test]
+    async fn update_reminder_sends_only_ato_and_md() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![task_item("task-1", "t", vec![])],
+        ));
+
+        let patch = TaskPatch {
+            reminder_time: Some(Some(56_700)),
+            ..Default::default()
+        };
+        service.update_task("task-1", patch).await.unwrap();
+
+        let payload = last_commit_payload(&fake, "task-1");
+        assert_eq!(payload["ato"], 56_700);
+        assert_eq!(payload.as_object().unwrap().len(), 2);
+        assert_eq!(
+            live_store(&service)
+                .get_task("task-1")
+                .unwrap()
+                .unwrap()
+                .reminder_time,
+            Some(56_700)
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_reminder_sends_null() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![task_item("task-1", "t", vec![])],
+        ));
+
+        let patch = TaskPatch {
+            reminder_time: Some(None),
+            ..Default::default()
+        };
+        service.update_task("task-1", patch).await.unwrap();
+
+        let payload = last_commit_payload(&fake, "task-1");
+        assert!(payload["ato"].is_null());
+        assert_eq!(
+            live_store(&service)
+                .get_task("task-1")
+                .unwrap()
+                .unwrap()
+                .reminder_time,
+            None
         );
     }
 

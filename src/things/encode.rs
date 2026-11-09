@@ -87,6 +87,8 @@ pub struct TaskDraft {
     pub tags: Vec<String>,
     /// `0` = todo, `1` = project.
     pub task_type: i64,
+    /// Reminder time as seconds since local midnight (wire `ato`).
+    pub reminder_time: Option<i64>,
     /// Repeater rule object; encoded into both `rr` and `rp`.
     pub repeater: Option<Value>,
     pub index: i64,
@@ -105,6 +107,7 @@ impl TaskDraft {
             heading: None,
             tags: Vec::new(),
             task_type: 0,
+            reminder_time: None,
             repeater: None,
             index: 0,
             today_index: 0,
@@ -117,6 +120,37 @@ impl TaskDraft {
         draft.when = When::Anytime;
         draft
     }
+}
+
+/// Parse `HH:MM` (or `HH:MM:SS`) into seconds since local midnight.
+pub fn parse_reminder(value: &str) -> Result<i64> {
+    let parts: Vec<&str> = value.trim().split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        bail!("invalid reminder time `{value}` (expected HH:MM)");
+    }
+    let hour: i64 = parts[0]
+        .parse()
+        .with_context(|| format!("invalid reminder hour in `{value}`"))?;
+    let minute: i64 = parts[1]
+        .parse()
+        .with_context(|| format!("invalid reminder minute in `{value}`"))?;
+    let second: i64 = if parts.len() == 3 {
+        parts[2]
+            .parse()
+            .with_context(|| format!("invalid reminder second in `{value}`"))?
+    } else {
+        0
+    };
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..60).contains(&second) {
+        bail!("invalid reminder time `{value}` (out of range)");
+    }
+    Ok(hour * 3600 + minute * 60 + second)
+}
+
+/// Format seconds since local midnight as `HH:MM`.
+pub fn format_reminder(seconds: i64) -> String {
+    let seconds = seconds.rem_euclid(86_400);
+    format!("{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60)
 }
 
 /// Parse `YYYY-MM-DD` into an epoch day.
@@ -179,7 +213,7 @@ pub fn task_create_payload(draft: &TaskDraft, today: i64, now: f64) -> Value {
         "icp": false,
         "icsd": Value::Null,
         "acrd": Value::Null,
-        "ato": Value::Null,
+        "ato": draft.reminder_time,
         "lt": false,
         "rmd": Value::Null,
         "xx": extension(),
@@ -332,7 +366,7 @@ pub fn validate_task_create(payload: &Value) -> Result<()> {
     }
     require_nullable_number(obj, "cd", false)?;
     for key in [
-        "md", "sp", "lai", "sr", "dd", "dds", "tir", "icsd", "acrd", "rmd",
+        "md", "sp", "lai", "sr", "dd", "dds", "tir", "icsd", "acrd", "rmd", "ato",
     ] {
         require_nullable_number(obj, key, true)?;
     }
@@ -478,6 +512,31 @@ mod tests {
             assert!(obj.contains_key(key), "missing {key}");
         }
         validate_task_create(&payload).expect("payload must pass the safety gate");
+    }
+
+    #[test]
+    fn reminder_times_roundtrip() {
+        assert_eq!(parse_reminder("15:45").unwrap(), 56_700);
+        assert_eq!(parse_reminder("9:05").unwrap(), 32_700);
+        assert_eq!(parse_reminder("23:00:30").unwrap(), 82_830);
+        assert!(parse_reminder("24:00").is_err());
+        assert!(parse_reminder("12:60").is_err());
+        assert!(parse_reminder("noon").is_err());
+        assert_eq!(format_reminder(56_700), "15:45");
+        assert_eq!(format_reminder(0), "00:00");
+    }
+
+    #[test]
+    fn create_payload_carries_the_reminder() {
+        let mut draft = TaskDraft::new("remind me");
+        draft.reminder_time = Some(parse_reminder("09:00").unwrap());
+
+        let payload = task_create_payload(&draft, today(), 1_700_000_000.0);
+        assert_eq!(payload["ato"], 32_400);
+        validate_task_create(&payload).unwrap();
+
+        let payload = task_create_payload(&TaskDraft::new("no reminder"), today(), 1.0);
+        assert!(payload["ato"].is_null());
     }
 
     #[test]

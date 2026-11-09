@@ -298,6 +298,8 @@ pub struct TaskSummary {
     pub view: String,
     pub start_date: Option<String>,
     pub deadline: Option<String>,
+    /// Reminder time as `HH:MM` (local), when set.
+    pub reminder: Option<String>,
     pub project: Option<String>,
     pub project_title: Option<String>,
     pub area: Option<String>,
@@ -377,6 +379,9 @@ pub fn task_summary(conn: &Connection, task: &Task, today: i64) -> Result<TaskSu
         view: task.view_str(today).to_string(),
         start_date: task.start_date.and_then(fmt::date_string),
         deadline: task.deadline.and_then(fmt::date_string),
+        reminder: task
+            .reminder_time
+            .map(crate::things::encode::format_reminder),
         project: task.project.clone(),
         project_title,
         area: task.area.clone(),

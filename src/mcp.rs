@@ -27,6 +27,7 @@ use crate::store::{
 use crate::sync::{SyncEngine, SyncReport};
 use crate::things::{
     ClientOptions, HttpTransport, TaskDraft, ThingsClient, ThingsError, When, parse_day,
+    parse_reminder,
 };
 use crate::write::{TaskPatch, WriteService};
 
@@ -272,6 +273,8 @@ pub struct CreateTaskArgs {
     pub heading_id: Option<String>,
     /// Tag ids (base58).
     pub tags: Option<Vec<String>>,
+    /// Reminder time in local time, `HH:MM` (wire `ato`).
+    pub reminder: Option<String>,
     /// Preview the exact wire payload without writing (default false).
     pub dry_run: Option<bool>,
 }
@@ -286,6 +289,8 @@ pub struct CreateProjectArgs {
     pub deadline: Option<String>,
     pub area_id: Option<String>,
     pub tags: Option<Vec<String>>,
+    /// Reminder time in local time, `HH:MM` (wire `ato`).
+    pub reminder: Option<String>,
     pub dry_run: Option<bool>,
 }
 
@@ -345,6 +350,9 @@ pub struct UpdateTaskArgs {
     pub clear_heading: Option<bool>,
     pub tags: Option<Vec<String>>,
     pub clear_tags: Option<bool>,
+    /// Reminder time in local time, `HH:MM` (wire `ato`).
+    pub reminder: Option<String>,
+    pub clear_reminder: Option<bool>,
     pub dry_run: Option<bool>,
 }
 
@@ -392,6 +400,7 @@ fn draft_from(
     area: Option<String>,
     heading: Option<String>,
     tags: Option<Vec<String>>,
+    reminder: Option<String>,
     task_type: i64,
 ) -> Result<TaskDraft, McpError> {
     let mut draft = TaskDraft::new(title);
@@ -408,6 +417,11 @@ fn draft_from(
     draft.area = area;
     draft.heading = heading;
     draft.tags = tags.unwrap_or_default();
+    draft.reminder_time = reminder
+        .as_deref()
+        .map(parse_reminder)
+        .transpose()
+        .map_err(invalid_param)?;
     Ok(draft)
 }
 
@@ -700,6 +714,7 @@ impl ThingsServer {
             args.area_id,
             args.heading_id,
             args.tags,
+            args.reminder,
             0,
         )?;
         let mut service = self.write_service(dry_run).await?;
@@ -724,6 +739,7 @@ impl ThingsServer {
             args.area_id,
             None,
             args.tags,
+            args.reminder,
             1,
         )?;
         let mut service = self.write_service(dry_run).await?;
@@ -807,6 +823,16 @@ impl ThingsServer {
         } else {
             args.tags
         };
+        let reminder_time = if args.clear_reminder.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.reminder
+                .as_deref()
+                .map(parse_reminder)
+                .transpose()
+                .map_err(invalid_param)?
+                .map(Some)
+        };
 
         let patch = TaskPatch {
             title: args.title,
@@ -822,6 +848,7 @@ impl ThingsServer {
             area,
             heading,
             tags,
+            reminder_time,
         };
 
         let mut service = self.write_service(dry_run).await?;

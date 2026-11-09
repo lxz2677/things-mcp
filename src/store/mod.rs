@@ -32,7 +32,7 @@ use crate::things::wire;
 use crate::things::{ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, IncomingItem};
 
 /// Bump when adding tables/columns; `init` applies migrations for older files.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Store {
     conn: Connection,
@@ -100,8 +100,23 @@ impl Store {
 
         conn.execute_batch(include_str!("schema.sql"))?;
 
+        // v2: reminder time (seconds since local midnight, wire `ato`).
+        // Kept idempotent because `user_version` may still be 0 on very old files.
+        let added_reminder_column = !column_exists(&conn, "task", "reminder_time")?;
+        if added_reminder_column {
+            conn.execute("ALTER TABLE task ADD COLUMN reminder_time INTEGER", [])?;
+        }
+        if existing < 2 || added_reminder_column {
+            // Backfill from the raw wire properties so existing replicas get
+            // their reminders without a full re-pull.
+            conn.execute(
+                "UPDATE task SET reminder_time = json_extract(raw, '$.ato')
+                 WHERE json_type(raw, '$.ato') = 'integer'",
+                [],
+            )?;
+        }
+
         if existing < SCHEMA_VERSION {
-            // Baseline: schema.sql creates every v1 table.
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(Self { conn })
@@ -613,6 +628,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         user_modification_date: row.get("user_modification_date")?,
         stop_date: row.get("stop_date")?,
         last_reminder_interaction_date: row.get("last_reminder_interaction_date")?,
+        reminder_time: row.get::<_, Option<i64>>("reminder_time").ok().flatten(),
         start: row.get("start")?,
         start_date: row.get("start_date")?,
         start_bucket: row.get("start_bucket")?,
@@ -651,6 +667,7 @@ fn save_task(conn: &Connection, task: &Task) -> Result<()> {
             id, kind, \"type\", status, trashed, title, notes,
             creation_date, user_modification_date, stop_date, last_reminder_interaction_date,
             start, start_date, start_bucket, deadline, deadline_suppression_date, deadline_offset,
+            reminder_time,
             index_value, today_index, today_index_reference_date,
             project, area, heading,
             recurrence_rule, repeating_template, instance_creation_start_date,
@@ -661,12 +678,13 @@ fn save_task(conn: &Connection, task: &Task) -> Result<()> {
             ?1, ?2, ?3, ?4, ?5, ?6, ?7,
             ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16, ?17,
-            ?18, ?19, ?20,
-            ?21, ?22, ?23,
-            ?24, ?25, ?26,
-            ?27, ?28,
-            ?29, ?30,
-            ?31, ?32, ?33
+            ?18,
+            ?19, ?20, ?21,
+            ?22, ?23, ?24,
+            ?25, ?26, ?27,
+            ?28, ?29,
+            ?30, ?31,
+            ?32, ?33, ?34
          )",
         params![
             task.id,
@@ -686,6 +704,7 @@ fn save_task(conn: &Connection, task: &Task) -> Result<()> {
             task.deadline,
             task.deadline_suppression_date,
             task.deadline_offset,
+            task.reminder_time,
             task.index,
             task.today_index,
             task.today_index_reference_date,
@@ -705,6 +724,17 @@ fn save_task(conn: &Connection, task: &Task) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn replace_task_tags(conn: &Connection, task: &Task) -> Result<()> {
@@ -904,6 +934,56 @@ mod tests {
     #[test]
     fn stamps_schema_version() {
         let store = Store::open_in_memory().unwrap();
+        let version: i64 = store
+            .connection()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_v1_databases_to_add_reminder_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.sqlite");
+
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO task (id, raw) VALUES ('t1', '{\"ato\":41400}')",
+                    [],
+                )
+                .unwrap();
+            store
+                .connection()
+                .execute("ALTER TABLE task DROP COLUMN reminder_time", [])
+                .unwrap();
+            store
+                .connection()
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let columns: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('task') WHERE name = 'reminder_time'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1);
+        let backfilled: i64 = store
+            .connection()
+            .query_row(
+                "SELECT reminder_time FROM task WHERE id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backfilled, 41_400);
         let version: i64 = store
             .connection()
             .pragma_query_value(None, "user_version", |row| row.get(0))
