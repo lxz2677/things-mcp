@@ -24,6 +24,9 @@ pub const TYPE_TODO: i64 = 0;
 pub const TYPE_PROJECT: i64 = 1;
 pub const TYPE_HEADING: i64 = 2;
 
+/// Cloud schema version this build was verified against.
+pub const SUPPORTED_SCHEMA: i64 = 301;
+
 pub const ACTION_CREATE: i64 = 0;
 pub const ACTION_UPDATE: i64 = 1;
 pub const ACTION_DELETE: i64 = 2;
@@ -40,10 +43,36 @@ pub enum EntityKind {
     Unknown,
 }
 
+/// Split a wire entity name (`Task7`) into its base (`Task`) and generation.
+pub fn parse_entity_name(name: &str) -> (&str, u32) {
+    let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    let digits = &name[base.len()..];
+    let generation = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().unwrap_or(u32::MAX)
+    };
+    (base, generation)
+}
+
+/// Highest entity generation this build understands, or `None` for an unknown
+/// entity kind.
+pub fn supported_entity_max(base: &str) -> Option<u32> {
+    match base {
+        "Task" => Some(7),
+        "Area" => Some(3),
+        "Tag" => Some(4),
+        "ChecklistItem" => Some(3),
+        "Settings" => Some(5),
+        "Tombstone" => Some(2),
+        _ => None,
+    }
+}
+
 impl EntityKind {
     /// Entity names on the wire carry a schema suffix (`Task7`, `Area3`, ...).
     pub fn from_wire(name: &str) -> Self {
-        let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
+        let (base, _) = parse_entity_name(name);
         match base {
             "Task" => Self::Task,
             "Area" => Self::Area,

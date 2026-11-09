@@ -76,6 +76,18 @@
 
 设置提醒时，任务或项目需要有开始日期。例如，运行 `things-mcp create "打电话" --when tomorrow --remind 09:00`，或在 MCP 的 `create_task` 工具中传入 `when: "tomorrow"` 和 `reminder: "09:00"`。要清除提醒，用 CLI 的 `update --clear-remind`，或在 `update_task` 中传入 `clear_reminder: true`。
 
+## 兼容性
+
+每次 sync 都会把云端的版本标记和本构建支持的范围比对：
+
+- `schema` / `latest-schema-version` 必须是 `301`
+- 实体代际不超过 `Task7`、`Area3`、`Tag4`、`ChecklistItem3`、`Settings5`、`Tombstone2`
+- 未知实体类型、未知动作 `t` 一律视为不兼容
+
+一旦发现更新：sync 立即停止并把状态写入本地；之后 CLI 和 MCP 的所有数据操作都会返回 `INCOMPATIBLE_VERSION` 警告并终止，不读也不写副本。`sync`、`verify`、`doctor`、`account` 仍可运行，方便升级后重新检测。`verify`、`doctor`、`sync_status` 会显示上次检测结果。
+
+检测发生在 sync 时；写操作本来就会先 sync，所以会在 commit 前被拦住。
+
 ## 卸载
 
 默认安装位置用下面这条命令卸载。如果安装时选了其他目录，把命令里的路径换成安装器输出的绝对路径。

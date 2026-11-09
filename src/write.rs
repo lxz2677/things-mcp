@@ -376,6 +376,9 @@ impl WriteService {
         let engine = match self {
             Self::Live(engine) => engine,
             Self::Preview(path) => {
+                if let Some(store) = Store::open_read_only(path)? {
+                    store.ensure_compatible()?;
+                }
                 return Ok(WriteOutcome {
                     status: "dry-run".into(),
                     id: id.into(),

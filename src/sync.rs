@@ -8,13 +8,17 @@
 //! * never request `start-index` beyond the head: the backend answers HTTP 500;
 //! * an empty page below the head means the pull stalled and must be retried.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 
 use crate::fmt;
 use crate::store::Store;
-use crate::things::{HistoryMeta, ThingsClient, ThingsError};
+use crate::things::{
+    HistoryMeta, IncomingItem, SUPPORTED_SCHEMA, ThingsClient, ThingsError, parse_entity_name,
+    supported_entity_max,
+};
 
 const MAX_PAGES: usize = 5_000;
 const MAX_EMPTY_PAGES: usize = 3;
@@ -38,6 +42,36 @@ pub struct SyncReport {
     pub full_reset: bool,
     pub history_replaced: bool,
     pub(crate) generation: i64,
+    pub(crate) cloud_schema: i64,
+    pub(crate) cloud_entities: BTreeMap<String, u32>,
+}
+
+#[derive(Debug)]
+struct IncompatibleVersion {
+    reason: String,
+    schema: Option<i64>,
+    entities: BTreeMap<String, u32>,
+}
+
+impl std::fmt::Display for IncompatibleVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for IncompatibleVersion {}
+
+fn incompatible(
+    reason: String,
+    schema: Option<i64>,
+    entities: &BTreeMap<String, u32>,
+) -> anyhow::Error {
+    IncompatibleVersion {
+        reason,
+        schema,
+        entities: entities.clone(),
+    }
+    .into()
 }
 
 impl SyncEngine {
@@ -77,21 +111,24 @@ impl SyncEngine {
             history_replaced,
             ..Default::default()
         };
-        if full || history_replaced {
+        let pull_result = if full || history_replaced {
             let directory = tempfile::tempdir()?;
             let path = directory.path().join("replica.sqlite");
             let mut staged = Store::open(&path)?;
             staged.bind_history(&report.history_key)?;
-            pull_history(
+            let result = pull_history(
                 &self.client,
                 &mut staged,
                 &mut report,
                 meta.latest_schema_version,
             )
-            .await?;
-            drop(staged);
-            self.store.replace_replica(&path, &state)?;
-            report.generation = state.generation + 1;
+            .await;
+            if result.is_ok() {
+                drop(staged);
+                self.store.replace_replica(&path, &state)?;
+                report.generation = state.generation + 1;
+            }
+            result
         } else {
             if state.history_key.as_deref() != Some(report.history_key.as_str()) {
                 self.store.bind_history(&report.history_key)?;
@@ -104,7 +141,27 @@ impl SyncEngine {
                 &mut report,
                 meta.latest_schema_version,
             )
-            .await?;
+            .await
+        };
+
+        match pull_result {
+            Ok(()) => {
+                self.store
+                    .set_compat_ok(report.cloud_schema, &report.cloud_entities)?;
+            }
+            Err(error) => {
+                if let Some(incompatible) = error.downcast_ref::<IncompatibleVersion>() {
+                    self.store.set_compat_incompatible(
+                        &incompatible.reason,
+                        incompatible.schema,
+                        &incompatible.entities,
+                    )?;
+                    return Err(
+                        ThingsError::IncompatibleVersion(incompatible.reason.clone()).into(),
+                    );
+                }
+                return Err(error);
+            }
         }
         Ok(report)
     }
@@ -147,7 +204,17 @@ async fn pull_history(
     let history_key = &report.history_key;
     let mut cursor = report.cursor;
     let mut head = report.head;
+    let mut cloud_schema = schema;
+    let mut cloud_entities: BTreeMap<String, u32> = BTreeMap::new();
     tracing::info!(history_key = %history_key, cursor, head, "sync started");
+
+    if schema != 0 && schema != SUPPORTED_SCHEMA {
+        return Err(incompatible(
+            format!("cloud schema {schema} (supported {SUPPORTED_SCHEMA})"),
+            Some(schema),
+            &cloud_entities,
+        ));
+    }
 
     let mut pages = 0usize;
     let mut empty_pages = 0usize;
@@ -158,6 +225,27 @@ async fn pull_history(
         }
 
         let page = client.items_page(history_key, cursor as usize).await?;
+
+        if page.schema != 0 {
+            if page.schema != SUPPORTED_SCHEMA {
+                return Err(incompatible(
+                    format!(
+                        "cloud schema {} (supported {SUPPORTED_SCHEMA})",
+                        page.schema
+                    ),
+                    Some(page.schema),
+                    &cloud_entities,
+                ));
+            }
+            cloud_schema = cloud_schema.max(page.schema);
+        }
+        if let Err(error) = check_items(&page.items, &mut cloud_entities) {
+            return Err(incompatible(
+                error.to_string(),
+                Some(cloud_schema),
+                &cloud_entities,
+            ));
+        }
 
         if page.batches == 0 {
             empty_pages += 1;
@@ -213,6 +301,8 @@ async fn pull_history(
     }
 
     head = head.max(cursor);
+    report.cloud_schema = cloud_schema;
+    report.cloud_entities = cloud_entities;
     store.finish_sync(
         history_key,
         report.generation,
@@ -225,5 +315,32 @@ async fn pull_history(
     report.cursor = cursor;
     report.head = head;
     report.pages = pages;
+    Ok(())
+}
+
+fn check_items(items: &[IncomingItem], entities: &mut BTreeMap<String, u32>) -> Result<()> {
+    for item in items {
+        if !(0..=2).contains(&item.action) {
+            bail!(
+                "unsupported action t={} for {} (expected 0|1|2)",
+                item.action,
+                item.uuid
+            );
+        }
+        let (base, generation) = parse_entity_name(&item.kind);
+        match supported_entity_max(base) {
+            None => bail!("unknown entity kind `{}`", item.kind),
+            Some(max) if generation > max => bail!(
+                "entity `{}` is newer than supported (max {base}{max})",
+                item.kind
+            ),
+            Some(_) => {
+                entities
+                    .entry(base.to_string())
+                    .and_modify(|current| *current = (*current).max(generation))
+                    .or_insert(generation);
+            }
+        }
+    }
     Ok(())
 }

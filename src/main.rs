@@ -590,7 +590,7 @@ async fn write_service(config: &Config, dry_run: bool) -> Result<WriteService> {
     if dry_run {
         return Ok(WriteService::Preview(config.db_path.clone()));
     }
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let client = build_client(config, &store)?;
     client.login().await.context("login failed")?;
     Ok(WriteService::live(SyncEngine::new(client, store)))
@@ -816,6 +816,12 @@ fn open_store(config: &Config) -> Result<Store> {
     Store::open(&config.db_path)
 }
 
+fn open_store_checked(config: &Config) -> Result<Store> {
+    let store = open_store(config)?;
+    store.ensure_compatible()?;
+    Ok(store)
+}
+
 fn build_client(config: &Config, store: &Store) -> Result<ThingsClient> {
     let app_instance_id = match store.app_instance_id()? {
         Some(value) if !value.is_empty() => value,
@@ -905,7 +911,7 @@ async fn sync(config: &Config, full: bool, json: bool) -> Result<()> {
 }
 
 fn lists(config: &Config, json: bool) -> Result<()> {
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let today = fmt::today_epoch_day();
     let counts = task_counts(store.connection(), today)?;
 
@@ -938,7 +944,7 @@ fn lists(config: &Config, json: bool) -> Result<()> {
 fn list(config: &Config, name: &str, limit: usize, offset: usize) -> Result<()> {
     let kind = ListKind::parse(name)
         .with_context(|| format!("unknown list `{name}`; see `things-mcp list --help`"))?;
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let conn = store.connection();
     let today = fmt::today_epoch_day();
 
@@ -987,7 +993,7 @@ fn search(
     include_completed: bool,
     limit: usize,
 ) -> Result<()> {
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let today = fmt::today_epoch_day();
     let status = match status.as_deref() {
         None => None,
@@ -1017,7 +1023,7 @@ fn search(
 }
 
 fn show(config: &Config, id: &str) -> Result<()> {
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let today = fmt::today_epoch_day();
     match task_detail(store.connection(), id, today)? {
         Some(detail) => print_json(&detail),
@@ -1026,7 +1032,7 @@ fn show(config: &Config, id: &str) -> Result<()> {
 }
 
 fn projects(config: &Config, area: Option<&str>, status: &str, limit: usize) -> Result<()> {
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let projects = list_projects(store.connection(), area, Some(status), limit)?;
     print_json(&serde_json::json!({
         "count": projects.len(),
@@ -1035,7 +1041,7 @@ fn projects(config: &Config, area: Option<&str>, status: &str, limit: usize) -> 
 }
 
 fn areas(config: &Config, limit: usize) -> Result<()> {
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let areas = list_areas(store.connection(), limit)?;
     print_json(&serde_json::json!({
         "count": areas.len(),
@@ -1044,7 +1050,7 @@ fn areas(config: &Config, limit: usize) -> Result<()> {
 }
 
 fn tags(config: &Config, limit: usize) -> Result<()> {
-    let store = open_store(config)?;
+    let store = open_store_checked(config)?;
     let tags = list_tags(store.connection(), limit)?;
     print_json(&serde_json::json!({
         "count": tags.len(),
@@ -1179,6 +1185,17 @@ fn doctor(config: &Config, json: bool) -> Result<()> {
     }
 
     println!("database: {}", config.db_path.display());
+    let compat = store.compat()?;
+    println!(
+        "compat:   {}",
+        if !compat.checked {
+            "unchecked".to_string()
+        } else if compat.ok {
+            format!("ok (cloud schema {})", compat.cloud_schema.unwrap_or(0))
+        } else {
+            format!("INCOMPATIBLE: {}", compat.reason.unwrap_or_default())
+        }
+    );
     println!();
     let mut failures = 0;
     for result in &results {
@@ -1222,6 +1239,17 @@ fn verify(config: &Config) -> Result<()> {
             .unwrap_or_else(|| "?".to_string())
     );
     println!("schema:    {}", store.schema_version()?);
+    let compat = store.compat()?;
+    println!(
+        "compat:    {}",
+        if !compat.checked {
+            "unchecked".to_string()
+        } else if compat.ok {
+            format!("ok (cloud schema {})", compat.cloud_schema.unwrap_or(0))
+        } else {
+            format!("INCOMPATIBLE: {}", compat.reason.unwrap_or_default())
+        }
+    );
     println!(
         "last sync: {}",
         store.last_sync_at()?.unwrap_or_else(|| "never".to_string())

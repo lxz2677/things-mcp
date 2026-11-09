@@ -179,6 +179,29 @@ pub fn audit(conn: &Connection) -> Result<Vec<CheckResult>> {
         ok: true,
     });
 
+    let compat_status: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'compat_status'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let compat_reason: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'compat_reason'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|reason| !reason.is_empty());
+    let incompatible = compat_status.as_deref() == Some("incompatible");
+    results.push(CheckResult {
+        name: "compat.status",
+        count: i64::from(incompatible),
+        samples: compat_reason.into_iter().collect(),
+        ok: !incompatible,
+    });
+
     let cursor: i64 = meta_i64(conn, "processed_remote_index")?.unwrap_or(0);
     let head = meta_i64(conn, "latest_server_index")?;
     let ahead = head.is_some_and(|head| cursor > head);
@@ -249,6 +272,26 @@ mod tests {
             !by_name("ref.project_missing").ok,
             "a project id without a row must be flagged"
         );
+    }
+
+    #[test]
+    fn flags_an_incompatible_replica() {
+        let store = seeded();
+        store
+            .set_compat_incompatible(
+                "cloud schema 302 (supported 301)",
+                Some(302),
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+
+        let results = audit(store.connection()).unwrap();
+        let check = results
+            .iter()
+            .find(|result| result.name == "compat.status")
+            .unwrap();
+        assert!(!check.ok);
+        assert_eq!(check.count, 1);
     }
 
     #[test]

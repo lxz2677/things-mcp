@@ -19,7 +19,7 @@ pub use encode::{
 };
 pub use model::{
     ACTION_CREATE, ACTION_DELETE, ACTION_UPDATE, Area, ChecklistItem, EntityKind, START_INBOX,
-    START_SOMEDAY, START_TODAY, STATUS_CANCELED, STATUS_COMPLETED, STATUS_OPEN, TYPE_HEADING,
-    TYPE_PROJECT, TYPE_TODO, Tag, Task,
+    START_SOMEDAY, START_TODAY, STATUS_CANCELED, STATUS_COMPLETED, STATUS_OPEN, SUPPORTED_SCHEMA,
+    TYPE_HEADING, TYPE_PROJECT, TYPE_TODO, Tag, Task, parse_entity_name, supported_entity_max,
 };
 pub use wire::{apply_area, apply_checklist_item, apply_tag, apply_task, day_from_wire};

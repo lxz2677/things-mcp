@@ -76,6 +76,18 @@ Restart the client and ask the agent to list your Today tasks.
 
 To set a reminder, give the item a start date. For example, run `things-mcp create "Call Sam" --when tomorrow --remind 09:00`, or pass `when: "tomorrow"` and `reminder: "09:00"` to the MCP tool `create_task`. Use `update --clear-remind` in the CLI or `clear_reminder: true` in `update_task` to remove it.
 
+## Compatibility
+
+Every sync compares the cloud's version markers with what this build supports:
+
+- `schema` / `latest-schema-version` must be `301`
+- entity generations may not exceed `Task7`, `Area3`, `Tag4`, `ChecklistItem3`, `Settings5`, `Tombstone2`
+- unknown entity kinds and unknown item actions are treated as incompatible
+
+When something is newer, the sync stops, the state is stored locally, and every CLI or MCP data operation returns an `INCOMPATIBLE_VERSION` warning without touching the replica. `sync`, `verify`, `doctor`, and `account` still run so you can re-check after upgrading things-mcp. `verify`, `doctor`, and `sync_status` show the last check.
+
+Detection happens at sync time. Writes always sync first, so they are blocked before any commit.
+
 ## Uninstall
 
 For the default location, run this command. If you chose a different directory, use the full path printed by the installer.

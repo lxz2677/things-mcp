@@ -151,6 +151,8 @@ pub enum ThingsError {
     Protocol(String),
     #[error("commit conflict: {0}")]
     Conflict(String),
+    #[error("incompatible Things Cloud version: {0}")]
+    IncompatibleVersion(String),
     #[error("empty items page at index {cursor} while server head is {head}")]
     Stalled { cursor: usize, head: i64 },
     #[error(transparent)]

@@ -46,6 +46,16 @@ pub(crate) struct SyncState {
     commit_head: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CompatStatus {
+    pub checked: bool,
+    pub ok: bool,
+    pub reason: Option<String>,
+    pub cloud_schema: Option<i64>,
+    pub entities: std::collections::BTreeMap<String, u32>,
+    pub checked_at: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ApplyStats {
     pub upserted: u64,
@@ -69,6 +79,14 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
+    }
+
+    /// Read the compatibility state without creating or migrating the database.
+    pub fn read_compat(path: &Path) -> Result<Option<CompatStatus>> {
+        match Self::open_read_only(path)? {
+            Some(store) => Ok(Some(store.compat()?)),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn open_read_only(path: &Path) -> Result<Option<Self>> {
@@ -176,6 +194,89 @@ impl Store {
 
     pub fn set_latest_server_index(&self, value: i64) -> Result<()> {
         set_meta(&self.conn, "latest_server_index", &value.to_string())
+    }
+
+    // -------------------------------------------------------- compatibility
+
+    pub fn compat(&self) -> Result<CompatStatus> {
+        let status = self.meta_get("compat_status")?;
+        Ok(CompatStatus {
+            checked: status.is_some(),
+            ok: status.as_deref() == Some("ok"),
+            reason: self.meta_get("compat_reason")?,
+            cloud_schema: meta_i64(&self.conn, "compat_cloud_schema")?,
+            entities: self
+                .meta_get("compat_entities")?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
+            checked_at: self.meta_get("compat_checked_at")?,
+        })
+    }
+
+    pub fn set_compat_ok(
+        &self,
+        schema: i64,
+        entities: &std::collections::BTreeMap<String, u32>,
+    ) -> Result<()> {
+        let existing = self.compat()?;
+        let mut merged = existing.entities.clone();
+        for (base, generation) in entities {
+            merged
+                .entry(base.clone())
+                .and_modify(|current| *current = (*current).max(*generation))
+                .or_insert(*generation);
+        }
+        let schema = schema.max(existing.cloud_schema.unwrap_or(0));
+        self.set_compat("ok", None, schema, &merged)
+    }
+
+    pub fn set_compat_incompatible(
+        &self,
+        reason: &str,
+        schema: Option<i64>,
+        entities: &std::collections::BTreeMap<String, u32>,
+    ) -> Result<()> {
+        let existing = self.compat()?;
+        let mut merged = existing.entities.clone();
+        for (base, generation) in entities {
+            merged
+                .entry(base.clone())
+                .and_modify(|current| *current = (*current).max(*generation))
+                .or_insert(*generation);
+        }
+        let schema = schema.unwrap_or(0).max(existing.cloud_schema.unwrap_or(0));
+        self.set_compat("incompatible", Some(reason), schema, &merged)
+    }
+
+    fn set_compat(
+        &self,
+        status: &str,
+        reason: Option<&str>,
+        schema: i64,
+        entities: &std::collections::BTreeMap<String, u32>,
+    ) -> Result<()> {
+        self.meta_set("compat_status", status)?;
+        self.meta_set("compat_reason", reason.unwrap_or(""))?;
+        self.meta_set("compat_cloud_schema", &schema.to_string())?;
+        self.meta_set(
+            "compat_entities",
+            &serde_json::to_string(entities).unwrap_or_else(|_| "{}".into()),
+        )?;
+        self.meta_set("compat_checked_at", &crate::fmt::now_rfc3339())?;
+        Ok(())
+    }
+
+    /// Refuse to touch the replica when the last sync found a newer cloud
+    /// schema or entity generation.
+    pub fn ensure_compatible(&self) -> Result<()> {
+        let compat = self.compat()?;
+        if compat.checked && !compat.ok {
+            anyhow::bail!(
+                "incompatible Things Cloud version: {} (update things-mcp before using this replica)",
+                compat.reason.unwrap_or_else(|| "unknown".into())
+            );
+        }
+        Ok(())
     }
 
     pub fn schema_version(&self) -> Result<i64> {

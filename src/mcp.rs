@@ -65,8 +65,18 @@ impl ThingsServer {
         }
     }
 
-    fn open_store(&self) -> Result<Store, McpError> {
+    fn open_store_raw(&self) -> Result<Store, McpError> {
         Store::open(&self.state.config.db_path).map_err(internal)
+    }
+
+    /// Data tools go through this gate: an incompatible cloud version blocks
+    /// every read and write until the replica is refreshed by a newer build.
+    fn open_store(&self) -> Result<Store, McpError> {
+        let store = self.open_store_raw()?;
+        store
+            .ensure_compatible()
+            .map_err(|error| incompatible_error(error))?;
+        Ok(store)
     }
 
     fn build_client(&self, store: &Store) -> Result<ThingsClient, McpError> {
@@ -119,7 +129,7 @@ impl ThingsServer {
             return Ok(None);
         }
 
-        let store = self.open_store()?;
+        let store = self.open_store_raw()?;
         let client = self.build_client(&store)?;
         client.login().await.map_err(things_error)?;
         let mut engine = SyncEngine::new(client, store);
@@ -383,7 +393,7 @@ impl ThingsServer {
         if dry_run {
             return Ok(WriteService::Preview(self.state.config.db_path.clone()));
         }
-        let store = self.open_store()?;
+        let store = self.open_store_raw()?;
         let client = self.build_client(&store)?;
         client.login().await.map_err(things_error)?;
         Ok(WriteService::live(SyncEngine::new(client, store)))
@@ -1049,7 +1059,7 @@ impl ThingsServer {
         let report = self.refresh(true, args.full).await?.ok_or_else(|| {
             McpError::internal_error("sync did not run", Some(json!({"code": "SYNC_SKIPPED"})))
         })?;
-        let store = self.open_store()?;
+        let store = self.open_store_raw()?;
         let payload = json!({
             "history_key": report.history_key,
             "cursor": report.cursor,
@@ -1068,7 +1078,7 @@ impl ThingsServer {
 
     #[tool(description = "Show sync state: history key, cursor, last sync, and list counts.")]
     async fn sync_status(&self) -> Result<CallToolResult, McpError> {
-        let store = self.open_store()?;
+        let store = self.open_store_raw()?;
         let today = fmt::today_epoch_day();
         let counts = task_counts(store.connection(), today).map_err(internal)?;
         let counts: serde_json::Map<String, Value> = counts
@@ -1082,6 +1092,7 @@ impl ThingsServer {
             "cursor": store.cursor().map_err(internal)?,
             "head": store.latest_server_index().map_err(internal)?,
             "schema": store.schema_version().map_err(internal)?,
+            "compat": serde_json::to_value(store.compat().map_err(internal)?).unwrap_or_default(),
             "last_sync_at": store.last_sync_at().map_err(internal)?,
             "tasks": store.task_count().map_err(internal)?,
             "counts": counts,
@@ -1157,6 +1168,13 @@ fn not_found(kind: &str, id: &str) -> McpError {
     )
 }
 
+fn incompatible_error(error: anyhow::Error) -> McpError {
+    McpError::internal_error(
+        error.to_string(),
+        Some(json!({ "code": "INCOMPATIBLE_VERSION" })),
+    )
+}
+
 fn invalid_param(error: impl std::fmt::Display) -> McpError {
     McpError::invalid_params(error.to_string(), None)
 }
@@ -1184,6 +1202,7 @@ fn code_of(error: &ThingsError) -> &'static str {
         ThingsError::Server { .. } => "SERVER_ERROR",
         ThingsError::Protocol(_) => "PROTOCOL_ERROR",
         ThingsError::Conflict(_) => "SYNC_CONFLICT",
+        ThingsError::IncompatibleVersion(_) => "INCOMPATIBLE_VERSION",
         ThingsError::Transport(_) => "NETWORK_ERROR",
     }
 }
@@ -1320,6 +1339,31 @@ mod tests {
         let second = server.list_payload(&ListKind::All, 1, 1).unwrap();
         assert_eq!(second["count"], 1);
         assert_eq!(second["has_more"], false);
+    }
+
+    #[test]
+    fn incompatible_replica_blocks_data_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("things.sqlite");
+        seed(&db);
+
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .set_compat_incompatible(
+                    "cloud schema 302 (supported 301)",
+                    Some(302),
+                    &std::collections::BTreeMap::new(),
+                )
+                .unwrap();
+        }
+
+        let server = server(&db);
+        assert!(server.open_store().is_err(), "data tools must be blocked");
+        assert!(
+            server.open_store_raw().is_ok(),
+            "diagnostics must still work"
+        );
     }
 
     #[test]
