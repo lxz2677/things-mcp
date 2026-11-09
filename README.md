@@ -5,7 +5,8 @@ English · [简体中文](README.zh-CN.md)
 `things-mcp` is an independent Things Cloud client and MCP server for macOS and Linux. It lets agents read and update your Things tasks through Things Cloud, with a local SQLite copy for listing and searching.
 
 - Browse tasks, projects, areas, tags, and checklists. Search task titles and notes.
-- Create and update tasks, organize them into projects and areas, and mark them complete. Write tools support `dry_run: true` to preview changes.
+- Create and update tasks, organize them into projects and areas, and mark them complete.
+- Create, rename, reparent, and delete tags and areas. Write tools support `dry_run: true` to preview changes.
 
 ## Install
 
