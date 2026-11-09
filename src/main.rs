@@ -175,6 +175,46 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Update a tag (rename, reparent, shortcut).
+    UpdateTag {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        clear_parent: bool,
+        #[arg(long)]
+        shortcut: Option<String>,
+        #[arg(long)]
+        clear_shortcut: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Hard delete a tag (`t=2`, Tag4).
+    DeleteTag {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Update an area (rename, replace its tags).
+    UpdateArea {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long)]
+        clear_tags: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Hard delete an area (`t=2`, Area3).
+    DeleteArea {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Update a task; only the provided fields are sent.
     Update {
         id: String,
@@ -361,6 +401,36 @@ async fn main() -> Result<()> {
             shortcut,
             dry_run,
         } => write_create_tag(&config, &title, parent, shortcut, dry_run).await,
+        Command::UpdateTag {
+            id,
+            title,
+            parent,
+            clear_parent,
+            shortcut,
+            clear_shortcut,
+            dry_run,
+        } => {
+            write_update_tag(
+                &config,
+                &id,
+                title,
+                parent,
+                clear_parent,
+                shortcut,
+                clear_shortcut,
+                dry_run,
+            )
+            .await
+        }
+        Command::DeleteTag { id, dry_run } => write_delete_tag(&config, &id, dry_run).await,
+        Command::UpdateArea {
+            id,
+            title,
+            tags,
+            clear_tags,
+            dry_run,
+        } => write_update_area(&config, &id, title, tags, clear_tags, dry_run).await,
+        Command::DeleteArea { id, dry_run } => write_delete_area(&config, &id, dry_run).await,
         Command::Update {
             id,
             title,
@@ -496,6 +566,60 @@ async fn write_create_tag(
             .create_tag(title, parent.as_deref(), shortcut.as_deref())
             .await?,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_update_tag(
+    config: &Config,
+    id: &str,
+    title: Option<String>,
+    parent: Option<String>,
+    clear_parent: bool,
+    shortcut: Option<String>,
+    clear_shortcut: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let parent = if clear_parent {
+        Some(None)
+    } else {
+        parent.map(Some)
+    };
+    let shortcut = if clear_shortcut {
+        Some(None)
+    } else {
+        shortcut.map(Some)
+    };
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.update_tag(id, title, parent, shortcut).await?)
+}
+
+async fn write_delete_tag(config: &Config, id: &str, dry_run: bool) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.delete_tag(id).await?)
+}
+
+async fn write_update_area(
+    config: &Config,
+    id: &str,
+    title: Option<String>,
+    tags: Vec<String>,
+    clear_tags: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let tags = if clear_tags {
+        Some(Vec::new())
+    } else if tags.is_empty() {
+        None
+    } else {
+        Some(tags)
+    };
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.update_area(id, title, tags).await?)
+}
+
+async fn write_delete_area(config: &Config, id: &str, dry_run: bool) -> Result<()> {
+    let mut service = write_service(config, dry_run).await?;
+    print_json(&service.delete_area(id).await?)
 }
 
 #[allow(clippy::too_many_arguments)]

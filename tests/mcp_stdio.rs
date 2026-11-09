@@ -118,7 +118,7 @@ fn stdio_server_lists_and_calls_tools() {
         .find(|value| value["id"] == 2)
         .expect("tools/list response");
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 29, "tool count");
+    assert_eq!(tools.len(), 33, "tool count");
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -145,6 +145,10 @@ fn stdio_server_lists_and_calls_tools() {
         "create_project",
         "create_area",
         "create_tag",
+        "update_tag",
+        "delete_tag",
+        "update_area",
+        "delete_area",
         "update_task",
         "complete_task",
         "cancel_task",

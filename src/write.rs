@@ -231,6 +231,92 @@ impl WriteService {
             .await
     }
 
+    pub async fn update_tag(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        parent: Option<Option<String>>,
+        shortcut: Option<Option<String>>,
+    ) -> Result<WriteOutcome> {
+        self.execute(id, ACTION_UPDATE, encode::TAG_KIND, "updated", |replica| {
+            let existing = expect_tag(replica, id)?;
+            let mut delta = Map::new();
+
+            if let Some(title) = &title
+                && *title != existing.title
+            {
+                delta.insert("tt".into(), json!(title));
+            }
+            if let Some(parent) = &parent {
+                if parent.as_deref() == Some(id) {
+                    bail!("a tag cannot be its own parent");
+                }
+                if let Some(parent_id) = parent
+                    && replica.query(|store| store.get_tag(parent_id))?.is_none()
+                {
+                    bail!("parent tag {parent_id} not found locally");
+                }
+                delta.insert("pn".into(), json!(parent.as_slice()));
+            }
+            if let Some(shortcut) = &shortcut {
+                delta.insert("sh".into(), json!(shortcut));
+            }
+
+            if delta.is_empty() {
+                bail!("nothing changed");
+            }
+            delta.insert("md".into(), json!(fmt::now_seconds()));
+            Ok(Value::Object(delta))
+        })
+        .await
+    }
+
+    pub async fn delete_tag(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.execute(id, ACTION_DELETE, encode::TAG_KIND, "deleted", |replica| {
+            expect_tag(replica, id)?;
+            Ok(json!({}))
+        })
+        .await
+    }
+
+    pub async fn update_area(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> Result<WriteOutcome> {
+        self.execute(id, ACTION_UPDATE, encode::AREA_KIND, "updated", |replica| {
+            let existing = expect_area(replica, id)?;
+            let mut delta = Map::new();
+
+            if let Some(title) = &title
+                && *title != existing.title
+            {
+                delta.insert("tt".into(), json!(title));
+            }
+            if let Some(tags) = &tags
+                && *tags != existing.tags
+            {
+                delta.insert("tg".into(), json!(tags));
+            }
+
+            if delta.is_empty() {
+                bail!("nothing changed");
+            }
+            delta.insert("md".into(), json!(fmt::now_seconds()));
+            Ok(Value::Object(delta))
+        })
+        .await
+    }
+
+    pub async fn delete_area(&mut self, id: &str) -> Result<WriteOutcome> {
+        self.execute(id, ACTION_DELETE, encode::AREA_KIND, "deleted", |replica| {
+            expect_area(replica, id)?;
+            Ok(json!({}))
+        })
+        .await
+    }
+
     async fn change_task(
         &mut self,
         id: &str,
@@ -363,6 +449,18 @@ fn validate_container(
     Ok(())
 }
 
+fn expect_tag(replica: &Replica<'_>, id: &str) -> Result<crate::things::Tag> {
+    replica
+        .query(|store| store.get_tag(id))?
+        .ok_or_else(|| anyhow!("tag {id} not found locally; run `things-mcp sync` first"))
+}
+
+fn expect_area(replica: &Replica<'_>, id: &str) -> Result<crate::things::Area> {
+    replica
+        .query(|store| store.get_area(id))?
+        .ok_or_else(|| anyhow!("area {id} not found locally; run `things-mcp sync` first"))
+}
+
 fn expect_task(replica: &Replica<'_>, id: &str) -> Result<crate::things::Task> {
     replica
         .query(|store| store.get_task(id))?
@@ -403,6 +501,65 @@ mod tests {
                 .unwrap();
         }
         SyncEngine::new(client(fake), store)
+    }
+
+    fn engine_with(fake: Arc<FakeTransport>, items: Vec<IncomingItem>) -> SyncEngine {
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_history_key("HK").unwrap();
+        if !items.is_empty() {
+            store.apply_items(&items).unwrap();
+        }
+        SyncEngine::new(client(fake), store)
+    }
+
+    fn tag_item(uuid: &str, title: &str) -> IncomingItem {
+        IncomingItem {
+            uuid: uuid.into(),
+            action: ACTION_CREATE,
+            kind: encode::TAG_KIND.into(),
+            props: json!({"tt": title, "ix": 0, "pn": [], "sh": null, "xx": {}})
+                .as_object()
+                .unwrap()
+                .clone(),
+            server_index: 0,
+        }
+    }
+
+    fn area_item(uuid: &str, title: &str) -> IncomingItem {
+        IncomingItem {
+            uuid: uuid.into(),
+            action: ACTION_CREATE,
+            kind: encode::AREA_KIND.into(),
+            props: json!({"tt": title, "ix": 0, "tg": [], "xx": {}})
+                .as_object()
+                .unwrap()
+                .clone(),
+            server_index: 0,
+        }
+    }
+
+    fn task_item(uuid: &str, title: &str, tags: Vec<&str>) -> IncomingItem {
+        IncomingItem {
+            uuid: uuid.into(),
+            action: ACTION_CREATE,
+            kind: encode::TASK_KIND.into(),
+            props: json!({"tt": title, "st": 0, "ss": 0, "tp": 0, "tg": tags})
+                .as_object()
+                .unwrap()
+                .clone(),
+            server_index: 0,
+        }
+    }
+
+    fn last_commit_payload(fake: &FakeTransport, id: &str) -> Value {
+        let commit = fake
+            .requests()
+            .into_iter()
+            .filter(|request| request.url.contains("/commit"))
+            .next_back()
+            .expect("commit request");
+        let body: Value = serde_json::from_slice(commit.body.as_ref().unwrap()).unwrap();
+        body[id]["p"].clone()
     }
 
     fn live_store(service: &WriteService) -> &Store {
@@ -685,5 +842,142 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn update_tag_sends_a_minimal_delta() {
+        let fake = fake_ok(1);
+        let mut service =
+            WriteService::live(engine_with(fake.clone(), vec![tag_item("tag-1", "old")]));
+
+        service
+            .update_tag("tag-1", Some("renamed".into()), None, None)
+            .await
+            .unwrap();
+
+        let payload = last_commit_payload(&fake, "tag-1");
+        assert_eq!(payload["tt"], "renamed");
+        assert!(payload["md"].is_number());
+        assert_eq!(payload.as_object().unwrap().len(), 2);
+        assert_eq!(
+            live_store(&service)
+                .get_tag("tag-1")
+                .unwrap()
+                .unwrap()
+                .title,
+            "renamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_tag_can_change_and_clear_parent() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![tag_item("parent", "p"), tag_item("tag-1", "child")],
+        ));
+
+        service
+            .update_tag("tag-1", None, Some(Some("parent".into())), None)
+            .await
+            .unwrap();
+        assert_eq!(last_commit_payload(&fake, "tag-1")["pn"], json!(["parent"]));
+
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![tag_item("parent", "p"), tag_item("tag-1", "child")],
+        ));
+        service
+            .update_tag("tag-1", None, Some(None), None)
+            .await
+            .unwrap();
+        assert_eq!(last_commit_payload(&fake, "tag-1")["pn"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn delete_tag_sends_tag4_and_clears_references() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                tag_item("tag-1", "urgent"),
+                task_item("task-1", "tagged", vec!["tag-1"]),
+            ],
+        ));
+
+        service.delete_tag("tag-1").await.unwrap();
+
+        let commit = fake
+            .requests()
+            .into_iter()
+            .find(|request| request.url.contains("/commit"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(commit.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["tag-1"]["t"], 2);
+        assert_eq!(body["tag-1"]["e"], "Tag4");
+        assert_eq!(body["tag-1"]["p"], json!({}));
+
+        let store = live_store(&service);
+        assert!(store.get_tag("tag-1").unwrap().is_none());
+        assert!(store.get_task("task-1").unwrap().unwrap().tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_area_replaces_tags() {
+        let fake = fake_ok(1);
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![area_item("area-1", "Work"), tag_item("tag-1", "urgent")],
+        ));
+
+        service
+            .update_area("area-1", None, Some(vec!["tag-1".into()]))
+            .await
+            .unwrap();
+
+        let payload = last_commit_payload(&fake, "area-1");
+        assert_eq!(payload["tg"], json!(["tag-1"]));
+        assert!(payload["md"].is_number());
+    }
+
+    #[tokio::test]
+    async fn delete_area_sends_area3_and_removes_the_row() {
+        let fake = fake_ok(1);
+        let mut service =
+            WriteService::live(engine_with(fake.clone(), vec![area_item("area-1", "Work")]));
+
+        service.delete_area("area-1").await.unwrap();
+
+        let commit = fake
+            .requests()
+            .into_iter()
+            .find(|request| request.url.contains("/commit"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(commit.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["area-1"]["t"], 2);
+        assert_eq!(body["area-1"]["e"], "Area3");
+        assert_eq!(body["area-1"]["p"], json!({}));
+        assert!(live_store(&service).get_area("area-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn preview_delete_tag_needs_no_network_and_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.sqlite");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.apply_items(&[tag_item("tag-1", "urgent")]).unwrap();
+        }
+
+        let mut service = WriteService::Preview(path.clone());
+        let outcome = service.delete_tag("tag-1").await.unwrap();
+
+        assert_eq!(outcome.status, "dry-run");
+        assert!(!outcome.pushed);
+        assert_eq!(outcome.payload, json!({}));
+
+        // The tag still exists on disk.
+        let store = Store::open(&path).unwrap();
+        assert!(store.get_tag("tag-1").unwrap().is_some());
     }
 }

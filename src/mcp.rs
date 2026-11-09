@@ -298,6 +298,30 @@ pub struct CreateTagArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateTagArgs {
+    /// Tag id (base58).
+    pub id: String,
+    pub title: Option<String>,
+    /// New parent tag id.
+    pub parent_id: Option<String>,
+    pub clear_parent: Option<bool>,
+    pub shortcut: Option<String>,
+    pub clear_shortcut: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateAreaArgs {
+    /// Area id (base58).
+    pub id: String,
+    pub title: Option<String>,
+    /// Tag ids attached to the area.
+    pub tags: Option<Vec<String>>,
+    pub clear_tags: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateTaskArgs {
     /// Task id (base58).
     pub id: String,
@@ -899,6 +923,84 @@ impl ThingsServer {
             .add_checklist_item(&args.task_id, &args.title)
             .await
             .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(
+        description = "Rename a tag, move it under another parent, or change/clear its shortcut."
+    )]
+    async fn update_tag(
+        &self,
+        Parameters(args): Parameters<UpdateTagArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let parent = if args.clear_parent.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.parent_id.map(Some)
+        };
+        let shortcut = if args.clear_shortcut.unwrap_or(false) {
+            Some(None)
+        } else {
+            args.shortcut.map(Some)
+        };
+
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .update_tag(&args.id, args.title, parent, shortcut)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(
+        description = "Permanently delete a tag (t=2, Tag4). Tasks keep their data but lose the tag reference."
+    )]
+    async fn delete_tag(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service.delete_tag(&args.id).await.map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Rename an area or replace its tag set.")]
+    async fn update_area(
+        &self,
+        Parameters(args): Parameters<UpdateAreaArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let tags = if args.clear_tags.unwrap_or(false) {
+            Some(Vec::new())
+        } else {
+            args.tags
+        };
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service
+            .update_area(&args.id, args.title, tags)
+            .await
+            .map_err(write_error)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(outcome).map_err(internal)?,
+        ))
+    }
+
+    #[tool(description = "Permanently delete an area (t=2, Area3).")]
+    async fn delete_area(
+        &self,
+        Parameters(args): Parameters<IdDryRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dry_run = args.dry_run.unwrap_or(false);
+        let mut service = self.write_service(dry_run).await?;
+        let outcome = service.delete_area(&args.id).await.map_err(write_error)?;
         Ok(CallToolResult::structured(
             serde_json::to_value(outcome).map_err(internal)?,
         ))
