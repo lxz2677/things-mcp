@@ -6,6 +6,7 @@ English · [简体中文](README.zh-CN.md) · [Changelog](CHANGELOG.md)
 
 - Browse tasks, projects, areas, tags, and checklists. Search task titles and notes.
 - Create and update tasks, organize them into projects and areas, and mark them complete.
+- Set or clear task reminders with a local `HH:MM` time.
 - Create, rename, and delete tags and areas, and move tags under a different parent. Write tools support `dry_run: true` to preview changes.
 
 ## Install
