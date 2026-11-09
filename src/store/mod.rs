@@ -376,12 +376,32 @@ impl Store {
         let Some(mut area) = get_area(&self.conn, id)? else {
             return Ok(None);
         };
-        load_area_tags(&self.conn, &mut area)?;
+        area.tags = area_tag_ids(&self.conn, id)?;
         Ok(Some(area))
+    }
+
+    pub(crate) fn first_task_in_area(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM task WHERE area = ?1 LIMIT 1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?)
     }
 
     pub fn get_tag(&self, id: &str) -> Result<Option<Tag>> {
         get_tag(&self.conn, id)
+    }
+
+    pub(crate) fn first_child_tag(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM tag WHERE parent = ?1 LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn checklist_for(&self, task_id: &str) -> Result<Vec<ChecklistItem>> {
@@ -477,7 +497,7 @@ fn apply_items(conn: &Connection, items: &[IncomingItem]) -> Result<ApplyStats> 
                     let mut area = get_area(conn, &item.uuid)?.unwrap_or_default();
                     area.id = item.uuid.clone();
                     area.kind = item.kind.clone();
-                    load_area_tags(conn, &mut area)?;
+                    area.tags = area_tag_ids(conn, &area.id)?;
                     wire::apply_area(&mut area, &item.props);
                     save_area(conn, &area)?;
                     replace_area_tags(conn, &area)?;
@@ -871,12 +891,10 @@ pub(crate) fn load_task_tags(conn: &Connection, task: &mut Task) -> Result<()> {
     Ok(())
 }
 
-/// Attach tag ids to an area loaded from a row.
-pub(crate) fn load_area_tags(conn: &Connection, area: &mut Area) -> Result<()> {
+fn area_tag_ids(conn: &Connection, area_id: &str) -> Result<Vec<String>> {
     let mut statement = conn.prepare("SELECT tag FROM area_tag WHERE area = ?1")?;
-    let rows = statement.query_map([&area.id], |row| row.get::<_, String>(0))?;
-    area.tags = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(())
+    let rows = statement.query_map([area_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 #[cfg(test)]

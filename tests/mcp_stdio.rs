@@ -10,19 +10,29 @@ use things_mcp::things::{ACTION_CREATE, IncomingItem};
 
 fn seed(path: &std::path::Path) {
     let mut store = Store::open(path).unwrap();
-    let items = [("inbox-1", "buy milk"), ("today-1", "ship the release")]
-        .into_iter()
-        .map(|(uuid, title)| IncomingItem {
-            uuid: uuid.to_string(),
-            action: ACTION_CREATE,
-            kind: "Task7".to_string(),
-            props: json!({"tt": title, "tp": 0, "ss": 0, "st": 0})
-                .as_object()
-                .unwrap()
-                .clone(),
-            server_index: 0,
-        })
-        .collect::<Vec<_>>();
+    let items = [
+        (
+            "inbox-1",
+            "Task7",
+            json!({"tt":"buy milk","tp":0,"ss":0,"st":0}),
+        ),
+        (
+            "today-1",
+            "Task7",
+            json!({"tt":"ship the release","tp":0,"ss":0,"st":0}),
+        ),
+        ("area-1", "Area3", json!({"tt":"Work","tg":["tag-1"]})),
+        ("tag-1", "Tag4", json!({"tt":"Urgent"})),
+    ]
+    .into_iter()
+    .map(|(uuid, kind, props)| IncomingItem {
+        uuid: uuid.to_string(),
+        action: ACTION_CREATE,
+        kind: kind.to_string(),
+        props: props.as_object().unwrap().clone(),
+        server_index: 0,
+    })
+    .collect::<Vec<_>>();
     store.apply_items(&items).unwrap();
 }
 
@@ -78,6 +88,12 @@ fn stdio_server_lists_and_calls_tools() {
                     "arguments": {"title": "preview", "dry_run": true}
                 }
             }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "get_area", "arguments": {"id": "area-1"}}
+            }),
         ] {
             writeln!(stdin, "{line}").unwrap();
         }
@@ -87,7 +103,7 @@ fn stdio_server_lists_and_calls_tools() {
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
     let mut responses: Vec<Value> = Vec::new();
-    while responses.len() < 4 {
+    while responses.len() < 5 {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap() == 0 {
             break;
@@ -182,4 +198,12 @@ fn stdio_server_lists_and_calls_tools() {
         "dry-run must expose the 34-key snapshot"
     );
     assert_eq!(payload["payload"]["tt"], "preview");
+
+    let area = responses
+        .iter()
+        .find(|value| value["id"] == 5)
+        .expect("get_area response");
+    let payload = &area["result"]["structuredContent"];
+    assert_eq!(payload["title"], "Work");
+    assert_eq!(payload["tags"], json!(["tag-1"]));
 }

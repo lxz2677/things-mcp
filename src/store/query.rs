@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::fmt;
 use crate::things::model::{STATUS_COMPLETED, TYPE_HEADING, TYPE_PROJECT, TYPE_TODO, Task};
 
-use super::{load_task_tags, task_from_row};
+use super::{area_tag_ids, load_task_tags, task_from_row};
 
 const ORDER_DEFAULT: &str =
     "index_value IS NULL, index_value ASC, title COLLATE NOCASE ASC, id ASC";
@@ -594,6 +594,7 @@ pub fn project_detail(
 pub struct AreaDetail {
     pub id: String,
     pub title: String,
+    pub tags: Vec<String>,
     pub projects: Vec<ProjectSummary>,
     pub tasks: Vec<TaskSummary>,
 }
@@ -620,6 +621,7 @@ pub fn area_detail(
     Ok(Some(AreaDetail {
         id: id.to_string(),
         title,
+        tags: area_tag_ids(conn, id)?,
         projects,
         tasks,
     }))

@@ -1,7 +1,19 @@
 #!/bin/sh
 set -eu
 
-release_url=https://github.com/lxz2677/things-mcp/releases/latest/download
+latest_release_url=https://github.com/lxz2677/things-mcp/releases/latest/download
+release_url=$latest_release_url
+mode=install
+if [ "${1-}" = --update ]; then
+  mode=update
+  release_url=$latest_release_url
+  shift
+fi
+if [ "$#" -ne 0 ]; then
+  printf 'Usage: sh install.sh [--update]\n' >&2
+  exit 1
+fi
+
 cd "${HOME:?Set HOME to your home directory}" || exit 1
 
 case "$(uname -s)" in
@@ -19,7 +31,11 @@ esac
 archive="things-mcp-$platform-$arch.tar.gz"
 install_dir=${THINGS_MCP_INSTALL_DIR:-}
 if [ -z "$install_dir" ] && [ -t 0 ]; then
-  printf 'Install directory [%s]: ' "$HOME" >&2
+  if [ "$mode" = update ]; then
+    printf 'Existing install directory [%s]: ' "$HOME" >&2
+  else
+    printf 'Install directory [%s]: ' "$HOME" >&2
+  fi
   IFS= read -r install_dir || exit 1
 fi
 install_dir=${install_dir:-$HOME}
@@ -29,7 +45,14 @@ case "$install_dir" in
   /*) ;;
   *) install_dir="$HOME/$install_dir" ;;
 esac
-mkdir -p "$install_dir" || exit 1
+if [ "$mode" = update ]; then
+  if [ ! -f "$install_dir/things-mcp" ] || [ ! -x "$install_dir/things-mcp" ]; then
+    printf 'No executable things-mcp found in %s. Choose the original install directory.\n' "$install_dir" >&2
+    exit 1
+  fi
+else
+  mkdir -p "$install_dir" || exit 1
+fi
 cd -P "$install_dir" || exit 1
 
 destination="$PWD/things-mcp"
@@ -55,6 +78,14 @@ else
 fi || exit 1
 
 tar -xzf "$archive" things-mcp &&
-  ./things-mcp --version &&
-  mv -f things-mcp "$destination" || exit 1
-printf 'Installed %s\n' "$destination"
+  ./things-mcp --version || exit 1
+if [ "$mode" = update ] && cmp -s things-mcp "$destination"; then
+  printf 'Already up to date at %s\n' "$destination"
+  exit 0
+fi
+mv -f things-mcp "$destination" || exit 1
+if [ "$mode" = update ]; then
+  printf 'Updated %s\n' "$destination"
+else
+  printf 'Installed %s\n' "$destination"
+fi

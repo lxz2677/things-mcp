@@ -645,7 +645,7 @@ impl ThingsServer {
         Ok(CallToolResult::structured(with_warning(payload, warning)))
     }
 
-    #[tool(description = "Get one area: its projects and open tasks.")]
+    #[tool(description = "Get an area's tag IDs, projects, and open tasks.")]
     async fn get_area(
         &self,
         Parameters(args): Parameters<GetByIdArgs>,
@@ -958,7 +958,7 @@ impl ThingsServer {
     }
 
     #[tool(
-        description = "Permanently delete a tag (t=2, Tag4). Tasks keep their data but lose the tag reference."
+        description = "Permanently delete a tag with no child tags. Tasks keep their data but lose the tag reference."
     )]
     async fn delete_tag(
         &self,
@@ -993,7 +993,9 @@ impl ThingsServer {
         ))
     }
 
-    #[tool(description = "Permanently delete an area (t=2, Area3).")]
+    #[tool(
+        description = "Permanently delete an area that has no tasks or projects referencing it."
+    )]
     async fn delete_area(
         &self,
         Parameters(args): Parameters<IdDryRunArgs>,

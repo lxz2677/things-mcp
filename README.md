@@ -1,22 +1,43 @@
 # things-mcp
 
-English · [简体中文](README.zh-CN.md)
+English · [简体中文](README.zh-CN.md) · [Changelog](CHANGELOG.md)
 
 `things-mcp` is an independent Things Cloud client and MCP server for macOS and Linux. It lets agents read and update your Things tasks through Things Cloud, with a local SQLite copy for listing and searching.
 
 - Browse tasks, projects, areas, tags, and checklists. Search task titles and notes.
 - Create and update tasks, organize them into projects and areas, and mark them complete.
-- Create, rename, reparent, and delete tags and areas. Write tools support `dry_run: true` to preview changes.
+- Create, rename, and delete tags and areas, and move tags under a different parent. Write tools support `dry_run: true` to preview changes.
 
 ## Install
 
-Run this command on macOS or Linux.
+For a first install on macOS or Linux, run this command.
 
 ```sh
-(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && eval "$installer")
+(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && sh -c "$installer" install.sh)
 ```
 
-Enter an installation directory when prompted, or press Enter to use your home directory. Without a terminal, the installer uses the home directory by default. Set `THINGS_MCP_INSTALL_DIR` to choose a different directory for automated installs. The installer verifies the release checksum and prints the full path to `things-mcp`.
+At the prompt, press Enter to install to `$HOME/things-mcp`, or enter a custom directory such as `~/bin`. Noninteractive installs also default to your home directory. Set `THINGS_MCP_INSTALL_DIR` to use a custom directory without a prompt. The installer verifies the release checksum and prints the installed version and full path.
+
+### Update
+
+If things-mcp is already installed, run the installer with `--update`.
+
+```sh
+(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && sh -c "$installer" install.sh --update)
+```
+
+Press Enter at `Existing install directory` if you installed to `$HOME/things-mcp`. For a custom install, enter the directory that contains the executable. You can find it from the `command` path in your MCP client configuration.
+
+To skip the prompt, set `THINGS_MCP_INSTALL_DIR` in the update command. This example updates `$HOME/bin/things-mcp`.
+
+```sh
+(
+  installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) &&
+    THINGS_MCP_INSTALL_DIR="$HOME/bin" sh -c "$installer" install.sh --update
+)
+```
+
+The updater verifies the latest stable release before replacing the executable at the same path. It prints the version and path, and reports when you already have the latest build. Restart your MCP client to load the updated executable.
 
 ### Install with an agent
 

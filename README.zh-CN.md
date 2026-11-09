@@ -1,22 +1,43 @@
 # things-mcp
 
-[English](README.md) · 简体中文
+[English](README.md) · 简体中文 · [更新日志](CHANGELOG.md)
 
 `things-mcp` 是一个独立的 Things Cloud 客户端和 MCP 服务，支持 macOS 和 Linux。它让 Agent 通过 Things Cloud 读取和修改 Things 任务，并把数据同步到本地 SQLite，供列表查询和搜索使用。
 
 - 浏览任务、项目、区域、标签和清单，搜索任务标题和备注。
 - 创建和更新任务，将任务归入项目和区域，或标记完成。
-- 创建、重命名、调整父级和删除标签与区域。写入工具支持用 `dry_run: true` 预览变更。
+- 创建、重命名和删除标签与区域，也可以调整标签的父级。写入工具支持用 `dry_run: true` 预览变更。
 
 ## 安装
 
-在 macOS 或 Linux 上运行这一行。
+首次在 macOS 或 Linux 上安装时，运行下面的命令。
 
 ```sh
-(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && eval "$installer")
+(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && sh -c "$installer" install.sh)
 ```
 
-安装时可以输入目录，直接回车就使用 Home。无交互终端时也默认用 Home，自动安装可以通过 `THINGS_MCP_INSTALL_DIR` 指定目录。安装器会校验预编译包，并输出 `things-mcp` 的绝对路径。
+看到目录提示时，直接回车会安装到 `$HOME/things-mcp`。也可以输入自定义目录，例如 `~/bin`。非交互运行时同样默认安装到主目录，可以用 `THINGS_MCP_INSTALL_DIR` 指定其他目录并跳过提示。安装器会校验预编译包，并输出版本号和程序的绝对路径。
+
+### 更新
+
+已经安装过 things-mcp 时，用 `--update` 更新到最新稳定版。
+
+```sh
+(installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) && sh -c "$installer" install.sh --update)
+```
+
+看到 `Existing install directory` 时，如果原来装在 `$HOME/things-mcp`，直接回车。如果装在其他位置，输入程序所在的目录。可以从 MCP 客户端配置的 `command` 路径找到它。
+
+也可以在命令里设置 `THINGS_MCP_INSTALL_DIR` 跳过提示。下面的例子会更新 `$HOME/bin/things-mcp`。
+
+```sh
+(
+  installer=$(curl -fsSL https://raw.githubusercontent.com/lxz2677/things-mcp/main/scripts/install.sh) &&
+    THINGS_MCP_INSTALL_DIR="$HOME/bin" sh -c "$installer" install.sh --update
+)
+```
+
+更新器校验通过后才会在原路径替换程序，并输出版本号和路径。已是最新版本时会提示 `Already up to date`。更新后重启 MCP 客户端即可加载新版。
 
 ### 让 Agent 安装
 

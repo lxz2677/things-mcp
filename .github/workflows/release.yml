@@ -113,7 +113,16 @@ jobs:
               exit 0
             fi
           else
-            gh release create "$tag" --verify-tag --generate-notes --draft "--prerelease=$prerelease"
+            awk -v heading="## $tag" '
+              $0 == heading { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' ../CHANGELOG.md > release-notes.md
+            notes=(--generate-notes)
+            if [[ -s release-notes.md ]]; then
+              notes=(--notes-file release-notes.md)
+            fi
+            gh release create "$tag" --verify-tag "${notes[@]}" --draft "--prerelease=$prerelease"
           fi
 
           gh release upload "$tag" --clobber "${assets[@]}"

@@ -191,7 +191,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Hard delete a tag (`t=2`, Tag4).
+    /// Permanently delete a tag with no child tags.
     DeleteTag {
         id: String,
         #[arg(long)]
@@ -209,7 +209,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Hard delete an area (`t=2`, Area3).
+    /// Permanently delete an area with no task or project references.
     DeleteArea {
         id: String,
         #[arg(long)]

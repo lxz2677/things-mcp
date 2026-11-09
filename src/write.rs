@@ -1,5 +1,6 @@
 //! Prepare write payloads for offline preview or sync and commit them to Things Cloud.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -248,13 +249,8 @@ impl WriteService {
                 delta.insert("tt".into(), json!(title));
             }
             if let Some(parent) = &parent {
-                if parent.as_deref() == Some(id) {
-                    bail!("a tag cannot be its own parent");
-                }
-                if let Some(parent_id) = parent
-                    && replica.query(|store| store.get_tag(parent_id))?.is_none()
-                {
-                    bail!("parent tag {parent_id} not found locally");
+                if let Some(parent_id) = parent {
+                    validate_tag_parent(replica, id, parent_id)?;
                 }
                 delta.insert("pn".into(), json!(parent.as_slice()));
             }
@@ -274,6 +270,11 @@ impl WriteService {
     pub async fn delete_tag(&mut self, id: &str) -> Result<WriteOutcome> {
         self.execute(id, ACTION_DELETE, encode::TAG_KIND, "deleted", |replica| {
             expect_tag(replica, id)?;
+            if let Some(child) = replica.query(|store| store.first_child_tag(id))? {
+                bail!(
+                    "cannot delete tag {id} while it has child tag {child}. Move or delete its child tags first."
+                );
+            }
             Ok(json!({}))
         })
         .await
@@ -294,10 +295,13 @@ impl WriteService {
             {
                 delta.insert("tt".into(), json!(title));
             }
-            if let Some(tags) = &tags
-                && *tags != existing.tags
-            {
-                delta.insert("tg".into(), json!(tags));
+            if let Some(tags) = &tags {
+                for tag_id in tags {
+                    expect_tag(replica, tag_id)?;
+                }
+                if *tags != existing.tags {
+                    delta.insert("tg".into(), json!(tags));
+                }
             }
 
             if delta.is_empty() {
@@ -312,6 +316,11 @@ impl WriteService {
     pub async fn delete_area(&mut self, id: &str) -> Result<WriteOutcome> {
         self.execute(id, ACTION_DELETE, encode::AREA_KIND, "deleted", |replica| {
             expect_area(replica, id)?;
+            if let Some(task) = replica.query(|store| store.first_task_in_area(id))? {
+                bail!(
+                    "cannot delete area {id} while it is referenced by {task}. Move its tasks and projects out first."
+                );
+            }
             Ok(json!({}))
         })
         .await
@@ -445,6 +454,23 @@ fn validate_container(
         if task.type_ != TYPE_HEADING {
             bail!("{id} is not a heading (type {})", task.type_);
         }
+    }
+    Ok(())
+}
+
+fn validate_tag_parent(replica: &Replica<'_>, id: &str, parent_id: &str) -> Result<()> {
+    let mut seen = HashSet::from([id.to_owned()]);
+    let mut next = Some(parent_id.to_owned());
+    while let Some(ancestor) = next {
+        if !seen.insert(ancestor.clone()) {
+            bail!(
+                "cannot move tag {id} under {parent_id} with a cycle in the parent chain at {ancestor}"
+            );
+        }
+        next = replica
+            .query(|store| store.get_tag(&ancestor))?
+            .ok_or_else(|| anyhow!("parent tag {ancestor} not found locally"))?
+            .parent;
     }
     Ok(())
 }
@@ -895,6 +921,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_tag_rejects_cycles_in_the_parent_chain() {
+        let fake = fake_ok(1);
+        let mut child = tag_item("child", "Child");
+        child.props.insert("pn".into(), json!(["root"]));
+        let mut grandchild = tag_item("grandchild", "Grandchild");
+        grandchild.props.insert("pn".into(), json!(["child"]));
+        let mut cyclic_tag = tag_item("loop", "Existing cycle");
+        cyclic_tag.props.insert("pn".into(), json!(["loop"]));
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![tag_item("root", "Root"), child, grandchild, cyclic_tag],
+        ));
+
+        for parent in ["root", "grandchild", "loop"] {
+            let error = service
+                .update_tag("root", None, Some(Some(parent.into())), None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("cycle in the parent chain"),
+                "{error}"
+            );
+        }
+        assert!(!fake.urls().iter().any(|url| url.contains("/commit")));
+    }
+
+    #[tokio::test]
     async fn delete_tag_sends_tag4_and_clears_references() {
         let fake = fake_ok(1);
         let mut service = WriteService::live(engine_with(
@@ -923,12 +976,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_area_replaces_tags() {
+    async fn delete_tag_rejects_tags_with_children() {
         let fake = fake_ok(1);
+        let mut child = tag_item("child", "Child");
+        child.props.insert("pn".into(), json!(["parent"]));
         let mut service = WriteService::live(engine_with(
             fake.clone(),
-            vec![area_item("area-1", "Work"), tag_item("tag-1", "urgent")],
+            vec![tag_item("parent", "Parent"), child],
         ));
+
+        let error = service.delete_tag("parent").await.unwrap_err();
+
+        assert!(error.to_string().contains("has child tag child"), "{error}");
+        assert!(!fake.urls().iter().any(|url| url.contains("/commit")));
+    }
+
+    #[tokio::test]
+    async fn update_area_replaces_tags() {
+        let fake = fake_ok(1);
+        let mut area = area_item("area-1", "Work");
+        area.props.insert("tg".into(), json!(["original"]));
+        let mut service = WriteService::live(engine_with(
+            fake.clone(),
+            vec![
+                area,
+                tag_item("original", "Original"),
+                tag_item("tag-1", "urgent"),
+            ],
+        ));
+
+        let error = service
+            .update_area("area-1", None, Some(vec!["tag-1".into(), "missing".into()]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("tag missing not found"),
+            "{error}"
+        );
+        assert!(!fake.urls().iter().any(|url| url.contains("/commit")));
+        let tags = live_store(&service)
+            .get_area("area-1")
+            .unwrap()
+            .unwrap()
+            .tags;
+        assert_eq!(tags, ["original"]);
 
         service
             .update_area("area-1", None, Some(vec!["tag-1".into()]))
@@ -958,6 +1049,39 @@ mod tests {
         assert_eq!(body["area-1"]["e"], "Area3");
         assert_eq!(body["area-1"]["p"], json!({}));
         assert!(live_store(&service).get_area("area-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_area_checks_references_after_sync_and_after_a_conflict() {
+        for conflict in [false, true] {
+            let commits = Arc::new(AtomicUsize::new(0));
+            let counter = commits.clone();
+            let fake = FakeTransport::new(move |request| {
+                if request.url.contains("/commit") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    return RawReply::json(409, r#"{"error":"OutdatedAncestor"}"#);
+                }
+                if request.url.contains("/items") {
+                    return RawReply::json(
+                        200,
+                        r#"{"current-item-index":1,"items":[{"project-1":{"t":0,"e":"Task7","p":{"tt":"Trashed project","tp":1,"tr":true,"ar":["area-1"]}}}]}"#,
+                    );
+                }
+                let head = i64::from(!conflict || counter.load(Ordering::SeqCst) > 0);
+                RawReply::json(200, json!({"latest-server-index":head}).to_string())
+            });
+            let mut service =
+                WriteService::live(engine_with(fake, vec![area_item("area-1", "Work")]));
+
+            let error = service.delete_area("area-1").await.unwrap_err();
+
+            assert!(
+                error.to_string().contains("referenced by project-1"),
+                "{error}"
+            );
+            assert_eq!(commits.load(Ordering::SeqCst), usize::from(conflict));
+            assert!(live_store(&service).get_area("area-1").unwrap().is_some());
+        }
     }
 
     #[tokio::test]
